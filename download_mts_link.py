@@ -845,6 +845,34 @@ def _probe_duration(path: Path) -> float:
         raise DownloadError(f"ffprobe вернул некорректную длительность для {path.name}.") from exc
 
 
+def _probe_stream_types(path: Path) -> set:
+    """Вернуть типы потоков, реально присутствующие в локальном контейнере.
+
+    Проверка нужна после операций ``-c copy``: если seek попал между ключевыми
+    кадрами, ffmpeg иногда создаёт небольшой MP4 только с аудио или вообще без
+    видеопотока. По размеру файла такую ошибку надёжно определить нельзя.
+    """
+
+    completed = subprocess.run(
+        [
+            _ffprobe_path(),
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "default=nw=1:nk=1",
+            str(path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        return set()
+    return {line.strip() for line in completed.stdout.splitlines() if line.strip()}
+
+
 def _download_source(segment: MediaSegment, destination: Path, referer: str) -> None:
     """Скачать MP4/HLS-сегмент через ffmpeg.
 
@@ -880,7 +908,15 @@ def _download_source(segment: MediaSegment, destination: Path, referer: str) -> 
                 f"Скачивание источника {source_url.rsplit('/', 1)[-1]}",
             )
             if destination.exists() and destination.stat().st_size > 0:
-                return
+                # Размер файла сам по себе не гарантирует, что ffmpeg записал
+                # видеопоток: повреждённый/неполный MP4 может быть ненулевым.
+                stream_types = _probe_stream_types(destination)
+                if "video" in stream_types:
+                    return
+                LOG.warning(
+                    "Источник создал файл без видеопотока (%s), пробую следующий URL",
+                    ", ".join(sorted(stream_types)) or "потоки отсутствуют",
+                )
         except (DownloadError, OSError) as exc:
             last_error = exc
             LOG.warning("Источник не скачан, пробую запасной вариант: %s", source_url)
@@ -921,6 +957,12 @@ def _trim_tail(source: Path, destination: Path, seconds: float) -> None:
     ``seconds`` — это не позиция начала, а фактическая длина активной части.
     Поэтому начало вычисляется от конца исходного файла. Операция выполняется
     после скачивания, чтобы не зависеть от точности удалённого seek.
+
+    Сначала пробуем быстрое копирование потоков. Если в коротком хвосте нет
+    видеопотока из-за отсутствия ключевого кадра, повторяем операцию с
+    перекодированием. Это особенно важно для первых сегментов длительностью
+    несколько секунд: контейнер может быть ненулевого размера, но непригоден
+    для concat demuxer.
     """
     duration = _probe_duration(source)
     if seconds <= 0 or seconds >= duration - 0.25:
@@ -928,6 +970,43 @@ def _trim_tail(source: Path, destination: Path, seconds: float) -> None:
         return
 
     start = max(0.0, duration - seconds)
+    trim_args = [
+        "-i",
+        str(source),
+        "-ss",
+        f"{start:.3f}",
+        "-t",
+        f"{seconds:.3f}",
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-c",
+        "copy",
+        "-avoid_negative_ts",
+        "make_zero",
+        "-y",
+        str(destination),
+    ]
+    _run_ffmpeg(trim_args, f"Отбрасывание преролла ({seconds:.1f} с)")
+
+    source_types = _probe_stream_types(source)
+    copied_types = _probe_stream_types(destination)
+    required_types = {"video"}
+    if "audio" in source_types:
+        required_types.add("audio")
+    if required_types.issubset(copied_types):
+        return
+
+    # Копирование не смогло сохранить все нужные потоки. Перекодируем только
+    # короткий хвост; остальные длинные сегменты по-прежнему остаются без
+    # перекодирования, поэтому обычное скачивание не становится существенно
+    # медленнее.
+    LOG.warning(
+        "Обрезанный сегмент не содержит нужные потоки (%s), выполняю резервное перекодирование",
+        ", ".join(sorted(copied_types)) or "потоки отсутствуют",
+    )
+    destination.unlink(missing_ok=True)
     _run_ffmpeg(
         [
             "-i",
@@ -940,8 +1019,22 @@ def _trim_tail(source: Path, destination: Path, seconds: float) -> None:
             "0:v:0",
             "-map",
             "0:a:0?",
-            "-c",
-            "copy",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
             "-avoid_negative_ts",
             "make_zero",
             "-y",
