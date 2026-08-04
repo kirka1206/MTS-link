@@ -30,12 +30,16 @@ class RecordingParsingTests(unittest.TestCase):
     def test_composite_choice_is_available_without_removing_old_selection(self):
         streams = [object(), object()]
         composite, selected = choose_download_plan(streams, "C")
-        self.assertTrue(composite)
+        self.assertEqual(composite, "composite")
         self.assertEqual(selected, streams)
 
         composite, selected = choose_download_plan(streams, "1")
-        self.assertFalse(composite)
+        self.assertEqual(composite, "separate")
         self.assertEqual(selected, [streams[0]])
+
+        package, selected = choose_download_plan(streams, "D")
+        self.assertEqual(package, "full-package")
+        self.assertEqual(selected, streams)
 
     def test_extracts_main_segments_and_trims_initial_preroll(self):
         record = {

@@ -157,6 +157,9 @@ class CompositeSegment:
 
 
 SelectableStream = Union[VideoStream, PresentationStream]
+DOWNLOAD_SEPARATE = "separate"
+DOWNLOAD_COMPOSITE = "composite"
+DOWNLOAD_FULL_PACKAGE = "full-package"
 
 
 def parse_recording_page(url: str) -> RecordingPage:
@@ -677,6 +680,7 @@ def print_stream_catalog(
         print(f"   положение в записи: {interval}", flush=True)
     print("\nA. Все потоки и источники", flush=True)
     print("C. Сводное видео: материалы + спикер в правом верхнем углу", flush=True)
+    print("D. Все источники и сводное видео", flush=True)
 
 
 def _parse_stream_selection(value: str, stream_count: int) -> List[int]:
@@ -743,41 +747,53 @@ def choose_download_plan(
     streams: Sequence[SelectableStream],
     requested: Optional[str],
     composite_requested: bool = False,
-) -> Tuple[bool, List[SelectableStream]]:
+    full_package_requested: bool = False,
+) -> Tuple[str, List[SelectableStream]]:
     """Вернуть план скачивания: composite-режим и выбранные источники.
 
-    ``--composite`` и буква ``C`` означают, что список отдельных потоков не
-    скачивается как пользовательский результат: он используется как вход для
-    автоматической сборки одного MP4. ``A`` и номера сохраняют прежнее
-    поведение.
+    ``--composite`` и буква ``C`` означают, что отдельные источники
+    используются только как временные входы для одного MP4. ``D``/``full``
+    сначала сохраняют все источники в выходную папку, а затем используют их
+    же для сводной сборки. ``A`` и номера сохраняют прежнее поведение.
     """
 
-    if composite_requested and requested is not None:
-        raise DownloadError("--composite нельзя использовать вместе с --streams.")
+    if composite_requested and full_package_requested:
+        raise DownloadError("--composite и --full-package нельзя использовать вместе.")
+    if (composite_requested or full_package_requested) and requested is not None:
+        raise DownloadError("Режим сборки нельзя использовать вместе с --streams.")
     if composite_requested:
-        return True, list(streams)
+        return DOWNLOAD_COMPOSITE, list(streams)
+    if full_package_requested:
+        return DOWNLOAD_FULL_PACKAGE, list(streams)
 
     if requested is not None:
-        if requested.strip().lower() in {"c", "composite", "сводное", "сводное видео"}:
-            return True, list(streams)
-        return False, choose_streams(streams, requested)
+        normalized = requested.strip().lower()
+        if normalized in {"c", "composite", "сводное", "сводное видео"}:
+            return DOWNLOAD_COMPOSITE, list(streams)
+        if normalized in {"d", "full", "full-package", "полный", "полный комплект"}:
+            return DOWNLOAD_FULL_PACKAGE, list(streams)
+        return DOWNLOAD_SEPARATE, choose_streams(streams, requested)
 
     if not sys.stdin.isatty():
         LOG.info("Интерактивный выбор недоступен, выбираю все потоки.")
-        return False, list(streams)
+        return DOWNLOAD_SEPARATE, list(streams)
 
     while True:
         try:
             value = input(
-                "\nВведите C для сводного видео, A для всех источников "
+                "\nВведите C для сводного видео, D для всех источников и сводного видео, "
+                "A для всех источников "
                 "или номера через запятую: "
             ).strip()
-            if value.lower() in {"c", "composite", "сводное", "сводное видео"}:
-                return True, list(streams)
+            normalized = value.lower()
+            if normalized in {"c", "composite", "сводное", "сводное видео"}:
+                return DOWNLOAD_COMPOSITE, list(streams)
+            if normalized in {"d", "full", "full-package", "полный", "полный комплект"}:
+                return DOWNLOAD_FULL_PACKAGE, list(streams)
             indexes = _parse_stream_selection(value, len(streams))
-            return False, [streams[index] for index in indexes]
+            return DOWNLOAD_SEPARATE, [streams[index] for index in indexes]
         except (TypeError, ValueError):
-            print("Не удалось распознать выбор. Пример: C, A или 1,2.")
+            print("Не удалось распознать выбор. Пример: C, D, A или 1,2.")
 
 
 def _ffmpeg_path() -> str:
@@ -1279,6 +1295,7 @@ COMPOSITE_HEIGHT = 720
 COMPOSITE_PIP_WIDTH = 160
 COMPOSITE_MARGIN = 16
 COMPOSITE_FPS = 25
+NORMALIZED_SOURCE_FPS = 30
 
 
 def _presentation_image_at(
@@ -1437,10 +1454,72 @@ def _video_encode_args() -> List[str]:
         "2",
         "-af",
         "aresample=async=1:first_pts=0",
+        # Просим MP4 muxer не откладывать слишком далеко пакеты одного из
+        # потоков. Это уменьшает предупреждения о poorly interleaved packets
+        # при коротких участках, вырезанных из длинной записи.
+        "-max_interleave_delta",
+        "0",
         "-avoid_negative_ts",
         "make_zero",
         "-y",
     ]
+
+
+def _normalize_speaker_source(source: Path, destination: Path) -> None:
+    """Нормализовать временные метки исходного видео спикера.
+
+    После concat с ``-c copy`` разные MP4-сегменты могут сохранить разные
+    DTS/PTS. Тогда видео декодируется с ускорением или рывками, хотя AAC-аудио
+    продолжает идти нормально. Принудительный последовательный PTS для 25
+    кадров/секунду и последовательный PTS аудио устраняют эту неоднозначность.
+    Перекодирование выполняется только над источником, который используется
+    внутри composite; отдельные скачанные MP4 остаются без лишней потери
+    качества. Используется ``fps`` по исходным PTS, а не ручная формула
+    ``N/(fps*TB)``: у исходных камер может быть не ровно 25 кадров/с, и такая
+    формула сама способна растянуть или ускорить видео относительно аудио.
+    """
+
+    _run_ffmpeg(
+        [
+            "-i",
+            str(source),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-vf",
+            f"setpts=PTS-STARTPTS,fps={NORMALIZED_SOURCE_FPS}",
+            "-af",
+            "asetpts=N/SR/TB",
+            "-r",
+            str(NORMALIZED_SOURCE_FPS),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-max_interleave_delta",
+            "0",
+            "-avoid_negative_ts",
+            "make_zero",
+            "-movflags",
+            "+faststart",
+            "-y",
+            str(destination),
+        ],
+        "Нормализация временных меток видео спикера",
+    )
 
 
 def _render_speaker_segment(
@@ -1549,13 +1628,17 @@ def download_composite(
     total_duration: float,
     output_path: Path,
     overwrite: bool,
+    speaker_source: Optional[Path] = None,
+    screen_source: Optional[Path] = None,
 ) -> Path:
     """Собрать синхронный MP4 из камеры, презентации и screen share.
 
     Временный pipeline такой:
 
-    * камера скачивается и становится источником непрерывного аудио;
-    * screen share скачивается как активный отдельный видеопоток;
+    * камера скачивается (если не передан ``speaker_source``) и становится
+      источником непрерывного аудио;
+    * screen share скачивается (если не передан ``screen_source``) как активный
+      отдельный видеопоток;
     * уникальные JPG слайдов скачиваются по presentation.update;
     * каждый участок временной шкалы перекодируется в 1280×720 H.264/AAC;
     * участки склеиваются без повторного изменения логики временной шкалы.
@@ -1586,13 +1669,29 @@ def download_composite(
 
     with tempfile.TemporaryDirectory(prefix="mts-link-composite-") as temp_name:
         temp_dir = Path(temp_name)
-        speaker_path = temp_dir / "speaker-source.mp4"
-        download_stream(page_info, speaker_stream, speaker_path, overwrite=True)
+        if speaker_source is None:
+            speaker_path = temp_dir / "speaker-source.mp4"
+            download_stream(page_info, speaker_stream, speaker_path, overwrite=True)
+        else:
+            if not speaker_source.exists():
+                raise DownloadError(f"Не найден локальный файл спикера: {speaker_source}")
+            speaker_path = speaker_source
+
+        # Нормализация обязательна и для обычного C, и для режима D. Она
+        # выполняется до нарезки по временной шкале, чтобы каждый seek видел
+        # равномерные PTS, а не исходные разрывы DTS между MP4-сегментами.
+        normalized_speaker_path = temp_dir / "speaker-source-normalized.mp4"
+        _normalize_speaker_source(speaker_path, normalized_speaker_path)
 
         screen_path: Optional[Path] = None
         if screen_stream:
-            screen_path = temp_dir / "screen-source.mp4"
-            download_stream(page_info, screen_stream, screen_path, overwrite=True)
+            if screen_source is None:
+                screen_path = temp_dir / "screen-source.mp4"
+                download_stream(page_info, screen_stream, screen_path, overwrite=True)
+            else:
+                if not screen_source.exists():
+                    raise DownloadError(f"Не найден локальный файл screen share: {screen_source}")
+                screen_path = screen_source
 
         slides_dir = temp_dir / "slides"
         slides_dir.mkdir(exist_ok=True)
@@ -1608,7 +1707,7 @@ def download_composite(
         for index, segment in enumerate(timeline, start=1):
             rendered = temp_dir / f"segment-{index:04d}.mp4"
             if segment.kind == "speaker":
-                _render_speaker_segment(speaker_path, segment, rendered)
+                _render_speaker_segment(normalized_speaker_path, segment, rendered)
             elif segment.kind == "presentation":
                 if not segment.image_url or segment.image_url not in image_paths:
                     raise DownloadError(
@@ -1616,7 +1715,7 @@ def download_composite(
                     )
                 _render_material_segment(
                     segment,
-                    speaker_path,
+                    normalized_speaker_path,
                     image_paths[segment.image_url],
                     rendered,
                 )
@@ -1625,7 +1724,7 @@ def download_composite(
                     raise DownloadError("Временная шкала содержит screen share без его файла.")
                 _render_material_segment(
                     segment,
-                    speaker_path,
+                    normalized_speaker_path,
                     screen_path,
                     rendered,
                     background_offset=max(0.0, segment.start_time - screen_stream.start_time),
@@ -1642,6 +1741,94 @@ def download_composite(
     actual_duration = _probe_duration(output_path)
     LOG.info("Готово: %s (%s)", output_path, _format_duration(actual_duration))
     return output_path
+
+
+def download_full_package(
+    page_info: RecordingPage,
+    streams: Sequence[VideoStream],
+    presentations: Sequence[PresentationStream],
+    total_duration: float,
+    output_dir: Path,
+    filename: Optional[str],
+    title: str,
+    session_id: int,
+    overwrite: bool,
+) -> List[Path]:
+    """Скачать все отдельные источники и собрать composite из локальных файлов.
+
+    В отличие от обычного ``C`` этот режим сначала сохраняет speaker MP4,
+    screen-share MP4 и PDF презентации в выходную папку. Затем пути уже
+    скачанных видео передаются в ``download_composite``, поэтому длинные
+    видеопотоки не скачиваются второй раз.
+    """
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    results: List[Path] = []
+    local_video_paths: Dict[str, Path] = {}
+
+    # Сначала создаём полный комплект отдельных видео. Порядок совпадает с
+    # прежним режимом A: сначала камера, затем screen share.
+    for stream in streams:
+        output_path = stream_output_path(
+            output_dir=output_dir,
+            filename=filename,
+            title=title,
+            session_id=session_id,
+            stream=stream,
+        )
+        result = download_stream(
+            page_info=page_info,
+            stream=stream,
+            output_path=output_path,
+            overwrite=overwrite,
+        )
+        local_video_paths[stream.key] = result
+        results.append(result)
+
+    # PDF остаётся отдельным исходным материалом и не заменяется слайдовым
+    # MP4: это позволяет получить полный оригинальный файл презентации.
+    for presentation in presentations:
+        output_path = presentation_output_path(
+            output_dir=output_dir,
+            filename=filename,
+            title=title,
+            session_id=session_id,
+            stream=presentation,
+        )
+        results.append(
+            download_presentation(
+                page_info=page_info,
+                stream=presentation,
+                output_path=output_path,
+                overwrite=overwrite,
+            )
+        )
+
+    speaker_stream = next((stream for stream in streams if stream.key == "speaker"), None)
+    if not speaker_stream:
+        raise DownloadError("Для полного комплекта не найден поток спикера.")
+    composite_path = composite_output_path(
+        output_dir=output_dir,
+        filename=filename,
+        title=title,
+        session_id=session_id,
+    )
+    results.append(
+        download_composite(
+            page_info=page_info,
+            speaker_stream=speaker_stream,
+            screen_stream=next(
+                (stream for stream in streams if stream.key == "screen-share"), None
+            ),
+            presentations=presentations,
+            total_duration=total_duration,
+            output_path=composite_path,
+            overwrite=overwrite,
+            speaker_source=local_video_paths["speaker"],
+            screen_source=local_video_paths.get("screen-share"),
+        )
+    )
+    return results
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1681,12 +1868,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--streams",
-        help="Потоки для скачивания: all, номера через запятую или composite",
+        help="Потоки для скачивания: all, номера, composite или full-package",
     )
     parser.add_argument(
         "--composite",
         action="store_true",
         help="Собрать презентацию, screen share и спикера в одно MP4 с PiP",
+    )
+    parser.add_argument(
+        "--full-package",
+        action="store_true",
+        help="Скачать все источники и затем собрать combined.mp4 из локальных файлов",
     )
     parser.add_argument(
         "-v",
@@ -1728,9 +1920,27 @@ async def async_main(args: argparse.Namespace) -> int:
         available_streams,
         args.streams,
         composite_requested=args.composite,
+        full_package_requested=args.full_package,
     )
     title = str(record.get("name") or f"mts-link-{page_info.session_id}")
-    if composite_mode:
+    if composite_mode == DOWNLOAD_FULL_PACKAGE:
+        results = download_full_package(
+            page_info=page_info,
+            streams=streams,
+            presentations=presentations,
+            total_duration=total_duration,
+            output_dir=args.output_dir,
+            filename=args.filename,
+            title=title,
+            session_id=page_info.session_id,
+            overwrite=args.overwrite,
+        )
+        print("\nВыбрано: все источники и сводное видео", flush=True)
+        for result in results:
+            print(result, flush=True)
+        return 0
+
+    if composite_mode == DOWNLOAD_COMPOSITE:
         # Composite использует отдельные источники как входные данные, но
         # сохраняет только один пользовательский результат - combined.mp4.
         speaker_stream = next(
