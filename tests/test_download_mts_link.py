@@ -7,6 +7,7 @@ from download_mts_link import (
     _parse_stream_selection,
     build_composite_timeline,
     choose_download_plan,
+    extract_audio_streams,
     extract_media_segments,
     extract_presentation_streams,
     extract_video_streams,
@@ -157,6 +158,65 @@ class RecordingParsingTests(unittest.TestCase):
         self.assertEqual(presentations[0].start_time, 5.0)
         self.assertEqual(presentations[0].duration, 45.0)
         self.assertEqual(presentations[0].slide_count, 2)
+
+    def test_extracts_audio_only_participant_as_separate_stream(self):
+        record = {
+            "duration": 120.0,
+            "eventLogs": [
+                {
+                    "relativeTime": 1.0,
+                    "snapshot": {
+                        "data": {
+                            "mediasession": [
+                                {
+                                    "url": "https://storage/speaker-initial.mp4",
+                                    "stream": {
+                                        "conference": {"id": 10},
+                                    },
+                                }
+                            ]
+                        }
+                    },
+                },
+                {
+                    "module": "conference.update",
+                    "relativeTime": 50.0,
+                    "data": {
+                        "id": 20,
+                        "hasVideo": False,
+                        "hasAudio": True,
+                        "user": {"nickname": "Слушатель 1"},
+                    },
+                },
+                {
+                    "module": "mediasession.add",
+                    "relativeTime": 5.0,
+                    "data": {
+                        "url": "https://storage/speaker-next.mp4",
+                        "stream": {"conference": {"id": 10}},
+                    },
+                },
+                {
+                    "module": "mediasession.add",
+                    "relativeTime": 50.0,
+                    "data": {
+                        "url": "https://storage/listener-question.mp4",
+                        "stream": {"conference": {"id": 20}},
+                    },
+                },
+            ],
+        }
+
+        audio_streams, duration = extract_audio_streams(record)
+
+        self.assertEqual(duration, 120.0)
+        self.assertEqual(len(audio_streams), 1)
+        self.assertEqual(audio_streams[0].title, "Аудио участника: Слушатель 1")
+        self.assertEqual(audio_streams[0].start_time, 50.0)
+        self.assertEqual(
+            audio_streams[0].segments[0].source_url,
+            "https://storage/listener-question.mp4",
+        )
 
     def test_composite_timeline_uses_presentation_and_screen_share_order(self):
         presentation = PresentationStream(

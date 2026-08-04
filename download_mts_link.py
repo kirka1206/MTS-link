@@ -9,14 +9,17 @@
 2. ``extract_video_streams`` разбирает ``mediasession`` и группирует файлы
    камеры/спикера и screen share. Один логический поток может состоять из
    нескольких последовательных MP4-сегментов.
-3. ``extract_presentation_streams`` отдельно разбирает события
+3. Участники, подключавшиеся только с микрофоном, выделяются в отдельные
+   ``AudioStream`` по ``conference.id``. Они сохраняются как M4A и могут быть
+   добавлены в сводный звук с исходным временем начала.
+4. ``extract_presentation_streams`` отдельно разбирает события
    ``presentation.update``. Презентация в МТС Линк не является H.264-потоком:
    API сообщает PDF и изображения активных слайдов.
-4. Каталог позволяет сохранить каждый источник отдельно или выбрать режим
+5. Каталог позволяет сохранить каждый источник отдельно или выбрать режим
    ``C``/``--composite``. В этом режиме строится общая временная шкала,
    слайды превращаются в видеоряд, а видео и аудио спикера накладываются на
    демонстрируемые материалы.
-5. Все временные файлы создаются в ``TemporaryDirectory`` и удаляются после
+6. Все временные файлы создаются в ``TemporaryDirectory`` и удаляются после
    завершения. Итоговый файл сначала записывается с суффиксом ``.part`` и
    переименовывается в конечное имя только после успешной сборки.
 
@@ -107,6 +110,31 @@ class VideoStream:
 
 
 @dataclass
+class AudioStream:
+    """Логический аудиопоток отдельного участника записи.
+
+    В МТС Линк вопрос слушателя может быть записан отдельной ``conference``-
+    сессией без видео. Такой источник нельзя смешивать с камерой только по
+    типу ``conference``: его нужно показать пользователю отдельно и добавить
+    в итоговый звук с учётом ``start_time``.
+    """
+
+    key: str
+    title: str
+    segments: List[MediaSegment]
+    duration: float
+    start_time: float
+    participant: Optional[str] = None
+    codec: Optional[str] = None
+
+    @property
+    def end_time(self) -> float:
+        """Вернуть правую границу активного интервала аудиопотока."""
+
+        return self.start_time + self.duration
+
+
+@dataclass
 class PresentationUpdate:
     """Одно событие смены состояния или текущего слайда презентации."""
 
@@ -156,7 +184,7 @@ class CompositeSegment:
     image_url: Optional[str] = None
 
 
-SelectableStream = Union[VideoStream, PresentationStream]
+SelectableStream = Union[VideoStream, AudioStream, PresentationStream]
 DOWNLOAD_SEPARATE = "separate"
 DOWNLOAD_COMPOSITE = "composite"
 DOWNLOAD_FULL_PACKAGE = "full-package"
@@ -209,6 +237,98 @@ def _stream_key(value: Any) -> Optional[str]:
     return None
 
 
+def _media_group_key(value: Any) -> Optional[str]:
+    """Вернуть стабильный ключ физической media-session.
+
+    ``_stream_key`` намеренно возвращает общий тип ``speaker`` для всех
+    конференций. Для записи этого недостаточно: камера лектора и микрофон
+    слушателя имеют один тип ``conference``, но разные IDs. Группировка по ID
+    позволяет восстановить их как независимые источники.
+    """
+
+    if not isinstance(value, dict):
+        return None
+    stream = value.get("stream") or {}
+    if not isinstance(stream, dict):
+        return None
+    if stream.get("screensharing"):
+        return "screen-share"
+    conference = stream.get("conference")
+    if isinstance(conference, dict):
+        identifier = conference.get("id") or conference.get("publicKey")
+        if identifier is not None:
+            return f"conference:{identifier}"
+        return "conference:unknown"
+    # Оставляем запасной путь для вариантов API, где аудио может называться
+    # не conference, а отдельным audio/microphone-полем.
+    for media_name in ("audio", "microphone"):
+        media = stream.get(media_name)
+        if isinstance(media, dict):
+            identifier = media.get("id") or media.get("publicKey")
+            return f"audio:{identifier or media_name}"
+    return None
+
+
+def _collect_conference_info(record: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Собрать возможности и имя каждого conference-источника из журнала.
+
+    Для одной конференции журнал содержит несколько ``conference.update``:
+    сначала участник подключается без медиа, затем включает микрофон, а при
+    завершении записи снова появляется состояние без потоков. Поэтому флаги
+    ``hasVideo``/``hasAudio`` собираются операцией OR по всем состояниям, а не
+    берутся только из последнего события.
+    """
+
+    event_logs = record.get("eventLogs") or []
+    result: Dict[str, Dict[str, Any]] = {}
+
+    def add_info(value: Any) -> None:
+        if not isinstance(value, dict):
+            return
+        identifier = value.get("id")
+        if identifier is None:
+            return
+        key = str(identifier)
+        info = result.setdefault(
+            key,
+            {
+                "has_video": False,
+                "has_audio": False,
+                "participant": None,
+                "user_id": None,
+                "participation_id": None,
+            },
+        )
+        info["has_video"] = bool(info["has_video"] or value.get("hasVideo"))
+        info["has_audio"] = bool(info["has_audio"] or value.get("hasAudio"))
+        if value.get("userId") is not None:
+            info["user_id"] = str(value["userId"])
+        if value.get("participationId") is not None:
+            info["participation_id"] = str(value["participationId"])
+        user = value.get("user")
+        if isinstance(user, dict):
+            participant = user.get("nickname") or user.get("name")
+            if participant:
+                info["participant"] = str(participant)
+            if user.get("id") is not None:
+                info["user_id"] = str(user["id"])
+
+    for event in event_logs:
+        if not isinstance(event, dict):
+            continue
+        snapshot = event.get("snapshot") or {}
+        snapshot_data = snapshot.get("data") if isinstance(snapshot, dict) else None
+        if isinstance(snapshot_data, dict):
+            for conference in snapshot_data.get("conference") or []:
+                add_info(conference)
+
+        module = event.get("module")
+        if module in {"conference.add", "conference.update", "conference.delete"}:
+            add_info(event.get("data"))
+
+    return result
+
+
 def _media_segment(
     value: Dict[str, Any], relative_time: float, initial: bool
 ) -> Optional[MediaSegment]:
@@ -218,7 +338,7 @@ def _media_segment(
     MP4 используется первым, а HLS остаётся резервным вариантом для ffmpeg.
     """
 
-    if not _stream_key(value):
+    if not _media_group_key(value):
         return None
 
     source_url = value.get("url")
@@ -238,27 +358,32 @@ def _media_segment(
     )
 
 
-def extract_video_streams(record: Dict[str, Any]) -> Tuple[List[VideoStream], float]:
-    """Extract logical video streams and their sequential media files.
+def _extract_media_streams(
+    record: Dict[str, Any],
+) -> Tuple[List[VideoStream], List[AudioStream], float]:
+    """Извлечь видеопотоки и отдельные аудиосессии из журнала записи.
 
-    MTS Link stores a recording as several media sessions. The first cut may
-    contain a short pre-roll in its source file. Later cut snapshots describe
-    active live streams, so only their actual ``mediasession.add`` events are
-    appended after the first snapshot. Conference media is grouped as the
-    speaker/camera stream, while screen sharing is kept as its own stream.
+    Все ``conference``-сессии выглядят одинаково на верхнем уровне API, но
+    внутри имеют собственный ``conference.id``. По этому ID и состояниям
+    ``conference.update`` разделяем камеру лектора и участников, которые
+    подключались только с микрофоном. Сегменты камеры разных IDs объединяются
+    в один логический поток спикера, а audio-only IDs становятся отдельными
+    ``AudioStream``.
     """
 
-    # В журнале есть snapshots и последующие события добавления сегментов.
-    # Нельзя просто взять все mediasession из всех snapshots: один и тот же
-    # сегмент тогда попадёт в итог несколько раз.
     event_logs = record.get("eventLogs") or []
     if not isinstance(event_logs, list):
         raise DownloadError("Ответ МТС Линк содержит некорректный журнал записи.")
 
-    # Snapshot даёт первый файл каждого типа. Он может содержать несколько
-    # секунд до нулевой точки записи, поэтому позже для него рассчитывается
-    # trim_duration.
-    initial_by_key: Dict[str, MediaSegment] = {}
+    conference_info = _collect_conference_info(record)
+    initial_by_group: Dict[str, MediaSegment] = {}
+    additions_by_group: Dict[str, List[MediaSegment]] = {}
+
+    # Повторные snapshots появляются на границах физических cuts. Берём
+    # только первый snapshot каждого общего типа, а последующие части — из
+    # mediasession.add. Это сохраняет прежнюю обработку преролла и не
+    # дублирует сегмент камеры из следующего snapshot.
+    seen_snapshot_types: set = set()
     for event in event_logs:
         if not isinstance(event, dict):
             continue
@@ -267,94 +392,206 @@ def extract_video_streams(record: Dict[str, Any]) -> Tuple[List[VideoStream], fl
         sessions = data.get("mediasession") if isinstance(data, dict) else None
         if not isinstance(sessions, list):
             continue
+        snapshot_types: set = set()
         for session in sessions:
+            broad_key = _stream_key(session) or (
+                "audio" if _media_group_key(session) else None
+            )
+            if not broad_key or broad_key in seen_snapshot_types:
+                snapshot_types.add(broad_key)
+                continue
             candidate = _media_segment(session, 0.0, initial=True)
-            key = _stream_key(session)
-            if candidate and key and key not in initial_by_key:
-                initial_by_key[key] = candidate
+            group_key = _media_group_key(session)
+            if candidate and group_key and group_key not in initial_by_group:
+                initial_by_group[group_key] = candidate
+            snapshot_types.add(broad_key)
+        seen_snapshot_types.update(item for item in snapshot_types if item)
 
-    # Реальные последующие части приходят отдельными mediasession.add.
-    additions_by_key: Dict[str, List[MediaSegment]] = {}
+    # Реальные новые части приходят отдельными mediasession.add и сохраняют
+    # relativeTime, необходимый как для склейки, так и для аудиомикширования.
     for event in event_logs:
         if not isinstance(event, dict) or event.get("module") != "mediasession.add":
             continue
         data = event.get("data")
         if not isinstance(data, dict):
             continue
-        relative_time = event.get("relativeTime", 0.0)
         try:
-            relative_time = float(relative_time)
+            relative_time = float(event.get("relativeTime", 0.0))
         except (TypeError, ValueError):
             continue
         candidate = _media_segment(data, relative_time, initial=False)
-        key = _stream_key(data)
-        if candidate and key:
-            additions_by_key.setdefault(key, []).append(candidate)
+        group_key = _media_group_key(data)
+        if candidate and group_key:
+            additions_by_group.setdefault(group_key, []).append(candidate)
 
-    # Порядок здесь влияет только на внутренний список. В пользовательском
-    # каталоге потоки дополнительно сортируются по моменту начала.
-    stream_names = {
-        "speaker": ("Спикер / камера", True),
-        "screen-share": ("Расшаренный экран", False),
-    }
-    streams: List[VideoStream] = []
-    for key, (title, has_audio) in stream_names.items():
-        additions = sorted(additions_by_key.get(key, []), key=lambda item: item.relative_time)
-        initial = initial_by_key.get(key)
+    try:
+        total_duration = max(0.0, float(record.get("duration") or 0.0))
+    except (TypeError, ValueError):
+        total_duration = 0.0
+
+    speaker_segments: List[MediaSegment] = []
+    screen_stream: Optional[VideoStream] = None
+    audio_streams: List[AudioStream] = []
+    participant_video_streams: List[VideoStream] = []
+    all_groups = set(initial_by_group) | set(additions_by_group)
+
+    # Первый video-capable conference считаем камерой лектора. Если лектор
+    # переподключался, его последующие conference IDs объединяются по
+    # user_id; видео другого участника остаётся отдельным источником.
+    video_group_keys = [
+        group_key
+        for group_key in all_groups
+        if group_key.startswith("conference:")
+        and conference_info.get(group_key.split(":", 1)[1], {}).get("has_video")
+    ]
+    primary_video_group: Optional[str] = None
+    if video_group_keys:
+        primary_video_group = min(
+            video_group_keys,
+            key=lambda group_key: (
+                (initial_by_group.get(group_key) or (additions_by_group.get(group_key) or [None])[0]).relative_time
+                if (initial_by_group.get(group_key) or additions_by_group.get(group_key))
+                else float("inf")
+            ),
+        )
+    primary_info = (
+        conference_info.get(primary_video_group.split(":", 1)[1], {})
+        if primary_video_group
+        else {}
+    )
+    primary_user_id = primary_info.get("user_id")
+
+    for group_key in all_groups:
+        initial = initial_by_group.get(group_key)
+        additions = sorted(
+            additions_by_group.get(group_key, []),
+            key=lambda item: item.relative_time,
+        )
         segments: List[MediaSegment] = []
-        seen: set = set()
+        seen_sources: set = set()
         if initial:
             initial_source = initial.source_url or initial.hls_url
             if initial_source:
                 segments.append(initial)
-                seen.add(initial_source)
-
-        # Удаляем повторные URL: API может прислать повторное событие для уже
-        # известного сегмента после обновления состояния плеера.
+                seen_sources.add(initial_source)
         for candidate in additions:
             candidate_source = candidate.source_url or candidate.hls_url
-            if not candidate_source or candidate_source in seen:
+            if not candidate_source or candidate_source in seen_sources:
                 continue
             segments.append(candidate)
-            seen.add(candidate_source)
-
-        if initial and additions and segments:
-            # The first file can contain pre-roll before the recording starts.
-            segments[0].trim_duration = max(0.0, additions[0].relative_time)
-
+            seen_sources.add(candidate_source)
         if not segments:
             continue
 
-        start_time = 0.0 if initial else segments[0].relative_time
-        streams.append(
-            VideoStream(
-                key=key,
-                title=title,
+        if initial and additions:
+            # Только первый snapshot-файл может содержать преролл до нулевой
+            # точки записи. Для audio-only initial это работает тем же образом.
+            segments[0].trim_duration = max(0.0, additions[0].relative_time)
+
+        if group_key == "screen-share":
+            screen_stream = VideoStream(
+                key="screen-share",
+                title="Расшаренный экран",
                 segments=segments,
                 duration=0.0,
-                start_time=start_time,
-                has_audio=has_audio,
+                start_time=segments[0].relative_time,
+                has_audio=False,
+            )
+            continue
+
+        if not group_key.startswith("conference:"):
+            audio_streams.append(
+                AudioStream(
+                    key=f"audio-{len(audio_streams) + 1}",
+                    title=f"Аудиопоток {len(audio_streams) + 1}",
+                    segments=segments,
+                    duration=0.0,
+                    start_time=segments[0].relative_time,
+                )
+            )
+            continue
+
+        conference_id = group_key.split(":", 1)[1]
+        info = conference_info.get(conference_id)
+        # В старых/неполных журналах conference.update может отсутствовать.
+        # Сохраняем обратную совместимость: неизвестные conference считаем
+        # камерой, как делала прежняя версия скрипта.
+        is_audio_only = bool(info and info.get("has_audio") and not info.get("has_video"))
+        if is_audio_only:
+            participant = info.get("participant") if info else None
+            title = f"Аудио участника: {participant}" if participant else "Аудио участника"
+            audio_streams.append(
+                AudioStream(
+                    key=f"audio-{conference_id}",
+                    title=title,
+                    segments=segments,
+                    duration=0.0,
+                    start_time=segments[0].relative_time,
+                    participant=participant,
+                )
+            )
+        else:
+            if (
+                info
+                and info.get("has_video")
+                and primary_user_id
+                and info.get("user_id")
+                and info.get("user_id") != primary_user_id
+            ):
+                participant = info.get("participant")
+                title = f"Видео участника: {participant}" if participant else "Видео участника"
+                participant_video_streams.append(
+                    VideoStream(
+                        key=f"participant-video-{conference_id}",
+                        title=title,
+                        segments=segments,
+                        duration=0.0,
+                        start_time=segments[0].relative_time,
+                        has_audio=bool(info.get("has_audio")),
+                    )
+                )
+            else:
+                speaker_segments.extend(segments)
+
+    speaker_segments.sort(key=lambda item: item.relative_time)
+    streams: List[VideoStream] = []
+    if speaker_segments:
+        streams.append(
+            VideoStream(
+                key="speaker",
+                title="Спикер / камера",
+                segments=speaker_segments,
+                duration=total_duration,
+                start_time=0.0,
+                has_audio=True,
             )
         )
+    streams.extend(participant_video_streams)
+    if screen_stream:
+        streams.append(screen_stream)
 
-    if not streams:
+    if not streams and not audio_streams:
         raise DownloadError(
-            "На странице не найден ни один видеопоток. "
+            "На странице не найден ни один медиапоток. "
             "Возможно, запись удалена или доступ к ней ограничен."
         )
+    return streams, audio_streams, total_duration
 
-    # Полная длительность записи относится к камере/спикеру, даже если
-    # screen share или презентация активны только в отдельном интервале.
-    try:
-        total_duration = float(record.get("duration") or 0.0)
-    except (TypeError, ValueError):
-        total_duration = 0.0
 
-    for stream in streams:
-        if stream.key == "speaker":
-            stream.duration = max(0.0, total_duration)
+def extract_video_streams(record: Dict[str, Any]) -> Tuple[List[VideoStream], float]:
+    """Вернуть видеопотоки, сохраняя прежнюю сигнатуру публичной функции."""
 
-    return streams, max(0.0, total_duration)
+    # Основная реализация теперь возвращает также audio-only источники. Этот
+    # адаптер оставляет прежнюю сигнатуру функции для внешних пользователей.
+    streams, _, total_duration = _extract_media_streams(record)
+    return streams, total_duration
+
+
+def extract_audio_streams(record: Dict[str, Any]) -> Tuple[List[AudioStream], float]:
+    """Вернуть отдельные audio-only потоки и длительность записи."""
+
+    _, audio_streams, total_duration = _extract_media_streams(record)
+    return audio_streams, total_duration
 
 
 def extract_presentation_streams(
@@ -552,9 +789,9 @@ def _output_stem(
 ) -> Path:
     """Определить общий путь без суффикса потока и расширения.
 
-    Один stem используется для трёх типов результатов: ``-speaker.mp4``,
-    ``-presentation.pdf`` и ``-combined.mp4``. Поэтому расширение входного
-    ``--filename`` здесь намеренно не сохраняется.
+    Один stem используется для разных типов результатов: ``-speaker.mp4``,
+    ``-audio-<id>.m4a``, ``-presentation.pdf`` и ``-combined.mp4``. Поэтому
+    расширение входного ``--filename`` здесь намеренно не сохраняется.
     """
 
     if filename:
@@ -583,6 +820,42 @@ def _probe_remote_media(url: str) -> Dict[str, Any]:
             "v:0",
             "-show_entries",
             "stream=codec_name,width,height:format=duration",
+            "-of",
+            "json",
+            url,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        return {}
+    try:
+        data = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return {}
+    stream = (data.get("streams") or [{}])[0]
+    fmt = data.get("format") or {}
+    result = dict(stream) if isinstance(stream, dict) else {}
+    try:
+        result["duration"] = float(fmt.get("duration"))
+    except (TypeError, ValueError):
+        pass
+    return result
+
+
+def _probe_remote_audio(url: str) -> Dict[str, Any]:
+    """Получить codec и длительность удалённого аудиофайла."""
+
+    completed = subprocess.run(
+        [
+            _ffprobe_path(),
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=codec_name,sample_rate,channels:format=duration",
             "-of",
             "json",
             url,
@@ -641,10 +914,32 @@ def enrich_video_streams(streams: Sequence[VideoStream], total_duration: float) 
         stream.duration = max(0.0, segment_duration)
 
 
+def enrich_audio_streams(audio_streams: Sequence[AudioStream]) -> None:
+    """Заполнить длительность и codec отдельных аудиопотоков."""
+
+    for stream in audio_streams:
+        active_duration = 0.0
+        first_url = stream.segments[0].source_url or stream.segments[0].hls_url
+        if first_url:
+            metadata = _probe_remote_audio(first_url)
+            stream.codec = metadata.get("codec_name")
+        for segment in stream.segments:
+            source_url = segment.source_url or segment.hls_url
+            if not source_url:
+                continue
+            metadata = _probe_remote_audio(source_url)
+            duration = metadata.get("duration")
+            if isinstance(duration, (int, float)):
+                active_duration += float(duration)
+        if stream.segments and stream.segments[0].trim_duration is not None:
+            active_duration = min(active_duration, stream.segments[0].trim_duration)
+        stream.duration = max(0.0, active_duration)
+
+
 def print_stream_catalog(
     streams: Sequence[SelectableStream], total_duration: float
 ) -> None:
-    """Напечатать нумерованный каталог видео, презентаций и режима C."""
+    """Напечатать нумерованный каталог видео, аудио, презентаций и режимов."""
 
     print("Доступные потоки и источники записи:", flush=True)
     for index, stream in enumerate(streams, start=1):
@@ -665,6 +960,15 @@ def print_stream_catalog(
             if stream.key == "speaker" and total_duration:
                 interval = f"00:00:00–{_format_duration(total_duration)}"
             print(f"   формат: {codec}, {size}, {audio}", flush=True)
+            print(
+                f"   частей: {len(stream.segments)}, активная длительность: {duration}",
+                flush=True,
+            )
+        elif isinstance(stream, AudioStream):
+            codec = stream.codec or "не определён"
+            duration = _format_duration(stream.duration) if stream.duration else "не определена"
+            interval = f"{_format_duration(stream.start_time)}–{_format_duration(stream.end_time)}"
+            print(f"   формат: {codec}, только звук", flush=True)
             print(
                 f"   частей: {len(stream.segments)}, активная длительность: {duration}",
                 flush=True,
@@ -1007,6 +1311,64 @@ def _add_missing_streams(
     return destination
 
 
+def _create_video_gap(
+    destination: Path,
+    duration: float,
+    stream: VideoStream,
+) -> None:
+    """Создать чёрный заполнитель для паузы между видеосегментами.
+
+    После отделения audio-only участника у камеры физически появляется
+    временной разрыв. Без заполнителя concat сдвинул бы следующий кадр
+    вперёд на несколько минут. Чёрный фон сохраняет положение камеры в
+    общей временной шкале, а тишина не подменяет отдельный аудиопоток.
+    """
+
+    width = stream.width or 1280
+    height = stream.height or 720
+    args = [
+        "-f",
+        "lavfi",
+        "-i",
+        f"color=c=black:s={width}x{height}:r={NORMALIZED_SOURCE_FPS}:d={duration:.3f}",
+    ]
+    if stream.has_audio:
+        args.extend(
+            [
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=48000:cl=stereo",
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+            ]
+        )
+    else:
+        args.extend(["-map", "0:v:0"])
+    args.extend(
+        [
+            "-t",
+            f"{duration:.3f}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-r",
+            str(NORMALIZED_SOURCE_FPS),
+        ]
+    )
+    if stream.has_audio:
+        args.extend(["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"])
+    args.extend(["-avoid_negative_ts", "make_zero", "-y", str(destination)])
+    _run_ffmpeg(args, f"Заполнение паузы камеры ({_format_duration(duration)})")
+
+
 def _download_source(segment: MediaSegment, destination: Path, referer: str) -> None:
     """Скачать MP4/HLS-сегмент через ffmpeg.
 
@@ -1085,6 +1447,45 @@ def _download_source(segment: MediaSegment, destination: Path, referer: str) -> 
     if last_error:
         raise DownloadError(f"Не удалось скачать ни один источник для сегмента: {last_error}")
     raise DownloadError("Для сегмента отсутствует URL источника.")
+
+
+def _download_audio_source(segment: MediaSegment, destination: Path, referer: str) -> None:
+    """Скачать только аудиодорожку физического conference-сегмента."""
+
+    headers = f"Referer: {referer}\r\nOrigin: {urlparse(referer).scheme}://{urlparse(referer).netloc}\r\n"
+    candidates = [url for url in (segment.source_url, segment.hls_url) if url]
+    last_error: Optional[Exception] = None
+    for source_url in candidates:
+        try:
+            destination.unlink(missing_ok=True)
+            _run_ffmpeg(
+                [
+                    "-headers",
+                    headers,
+                    "-i",
+                    source_url,
+                    "-map",
+                    "0:a:0",
+                    "-vn",
+                    "-c:a",
+                    "copy",
+                    "-movflags",
+                    "+faststart",
+                    "-y",
+                    str(destination),
+                ],
+                f"Скачивание аудиоисточника {source_url.rsplit('/', 1)[-1]}",
+            )
+            if destination.exists() and destination.stat().st_size > 0:
+                if "audio" in _probe_stream_types(destination):
+                    return
+        except (DownloadError, OSError) as exc:
+            last_error = exc
+            LOG.warning("Аудиоисточник не скачан, пробую запасной вариант: %s", source_url)
+
+    if last_error:
+        raise DownloadError(f"Не удалось скачать аудиоисточник: {last_error}")
+    raise DownloadError("Для аудиопотока отсутствует URL источника.")
 
 
 def _download_file(source_url: str, destination: Path, referer: str) -> None:
@@ -1205,6 +1606,67 @@ def _trim_tail(source: Path, destination: Path, seconds: float) -> None:
     )
 
 
+def _trim_audio_tail(source: Path, destination: Path, seconds: float) -> None:
+    """Оставить активный хвост audio-only сегмента без требования видео."""
+
+    duration = _probe_duration(source)
+    if seconds <= 0 or seconds >= duration - 0.25:
+        shutil.copy2(source, destination)
+        return
+
+    start = max(0.0, duration - seconds)
+    _run_ffmpeg(
+        [
+            "-i",
+            str(source),
+            "-ss",
+            f"{start:.3f}",
+            "-t",
+            f"{seconds:.3f}",
+            "-map",
+            "0:a:0",
+            "-vn",
+            "-c:a",
+            "copy",
+            "-avoid_negative_ts",
+            "make_zero",
+            "-y",
+            str(destination),
+        ],
+        f"Обрезание преролла аудиопотока ({seconds:.1f} с)",
+    )
+    if "audio" in _probe_stream_types(destination):
+        return
+
+    destination.unlink(missing_ok=True)
+    _run_ffmpeg(
+        [
+            "-i",
+            str(source),
+            "-ss",
+            f"{start:.3f}",
+            "-t",
+            f"{seconds:.3f}",
+            "-map",
+            "0:a:0",
+            "-vn",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-avoid_negative_ts",
+            "make_zero",
+            "-y",
+            str(destination),
+        ],
+        f"Обрезание преролла аудиопотока ({seconds:.1f} с)",
+    )
+
+
 def _concat_segments(segment_paths: Sequence[Path], destination: Path, duration: float) -> None:
     """Склеить локальные MP4 в один файл через concat demuxer ffmpeg.
 
@@ -1242,6 +1704,69 @@ def _concat_segments(segment_paths: Sequence[Path], destination: Path, duration:
         _run_ffmpeg(args, "Объединение сегментов в итоговый MP4")
     finally:
         list_path.unlink(missing_ok=True)
+
+
+def _concat_audio_segments(
+    segment_paths: Sequence[Path], destination: Path, duration: float
+) -> None:
+    """Склеить локальные аудиочасти в один M4A без видеопотока."""
+
+    list_path = destination.with_suffix(".concat.txt")
+    lines = []
+    for path in segment_paths:
+        escaped = str(path).replace("'", "'\\''")
+        lines.append(f"file '{escaped}'")
+    list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    try:
+        args: List[str] = [
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(list_path),
+            "-map",
+            "0:a:0",
+            "-vn",
+            "-c:a",
+            "copy",
+            "-movflags",
+            "+faststart",
+        ]
+        if duration > 0:
+            args.extend(["-t", f"{duration:.3f}"])
+        args.extend(["-y", str(destination)])
+        _run_ffmpeg(args, "Объединение аудиосегментов")
+    finally:
+        list_path.unlink(missing_ok=True)
+
+
+def _create_silence_audio(destination: Path, duration: float) -> None:
+    """Создать AAC-фрагмент тишины для паузы между аудиосегментами."""
+
+    _run_ffmpeg(
+        [
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=48000:cl=stereo",
+            "-t",
+            f"{duration:.3f}",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-movflags",
+            "+faststart",
+            "-y",
+            str(destination),
+        ],
+        f"Заполнение паузы аудиопотока ({_format_duration(duration)})",
+    )
 
 
 async def analyze_page(page_info: RecordingPage, headed: bool) -> Dict[str, Any]:
@@ -1338,6 +1863,19 @@ def stream_output_path(
     return stem.with_name(f"{stem.name}-{stream.key}.mp4")
 
 
+def audio_output_path(
+    output_dir: Path,
+    filename: Optional[str],
+    title: str,
+    session_id: int,
+    stream: AudioStream,
+) -> Path:
+    """Построить имя отдельного M4A-файла для audio-only участника."""
+
+    stem = _output_stem(output_dir, filename, title, session_id)
+    return stem.with_name(f"{stem.name}-{stream.key}.m4a")
+
+
 def presentation_output_path(
     output_dir: Path,
     filename: Optional[str],
@@ -1383,9 +1921,25 @@ def download_stream(
     with tempfile.TemporaryDirectory(prefix="mts-link-") as temp_name:
         temp_dir = Path(temp_name)
         local_segments: List[Path] = []
+        timeline_position = 0.0
         # Скачиваем физические файлы по одному, чтобы не держать несколько
         # гигабайт данных в памяти и иметь резервный HLS-вариант для каждого.
         for index, segment in enumerate(segments, start=1):
+            # После выделения audio-only conference из speaker-потока между
+            # соседними видеофайлами может быть настоящая пауза. Вставляем
+            # чёрный участок, иначе последующая камера и screen share
+            # окажутся раньше своего места в записи.
+            if (
+                stream.key == "speaker"
+                and index > 1
+                and segment.relative_time > timeline_position + 0.5
+            ):
+                gap_duration = segment.relative_time - timeline_position
+                gap = temp_dir / f"source-{index:03d}-gap.mp4"
+                _create_video_gap(gap, gap_duration, stream)
+                local_segments.append(gap)
+                timeline_position += gap_duration
+
             downloaded = temp_dir / f"source-{index:03d}.mp4"
             _download_source(segment, downloaded, page_info.url)
 
@@ -1404,13 +1958,69 @@ def download_stream(
                 trimmed = temp_dir / "source-001-trimmed.mp4"
                 _trim_tail(prepared, trimmed, segment.trim_duration)
                 local_segments.append(trimmed)
+                timeline_position += _probe_duration(trimmed)
             else:
                 local_segments.append(prepared)
+                timeline_position += _probe_duration(prepared)
 
         # Склеиваем только после обработки всех частей: так ошибка одного
         # сегмента не оставляет пользователю правдоподобный, но неполный MP4.
         combined = temp_dir / "combined.mp4"
         _concat_segments(local_segments, combined, duration)
+        shutil.copy2(combined, partial_path)
+
+    os.replace(partial_path, output_path)
+    actual_duration = _probe_duration(output_path)
+    LOG.info("Готово: %s (%s)", output_path, _format_duration(actual_duration))
+    return output_path
+
+
+def download_audio_stream(
+    page_info: RecordingPage,
+    stream: AudioStream,
+    output_path: Path,
+    overwrite: bool,
+) -> Path:
+    """Скачать и склеить все части отдельного аудиопотока в M4A."""
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists() and not overwrite:
+        raise DownloadError(
+            f"Файл уже существует: {output_path}. Добавьте --overwrite для перезаписи."
+        )
+
+    LOG.info("Аудиопоток «%s»: сегментов %d", stream.title, len(stream.segments))
+    if stream.duration:
+        LOG.info("Активная длительность аудиопотока: %s", _format_duration(stream.duration))
+
+    partial_path = output_path.with_name(output_path.name + ".part")
+    partial_path.unlink(missing_ok=True)
+    with tempfile.TemporaryDirectory(prefix="mts-link-audio-") as temp_name:
+        temp_dir = Path(temp_name)
+        local_segments: List[Path] = []
+        timeline_position = 0.0
+        for index, segment in enumerate(stream.segments, start=1):
+            expected_position = max(0.0, segment.relative_time - stream.start_time)
+            if index > 1 and expected_position > timeline_position + 0.5:
+                gap_duration = expected_position - timeline_position
+                gap = temp_dir / f"source-{index:03d}-gap.m4a"
+                _create_silence_audio(gap, gap_duration)
+                local_segments.append(gap)
+                timeline_position += gap_duration
+
+            downloaded = temp_dir / f"source-{index:03d}.m4a"
+            _download_audio_source(segment, downloaded, page_info.url)
+            if index == 1 and segment.trim_duration is not None:
+                trimmed = temp_dir / "source-001-trimmed.m4a"
+                _trim_audio_tail(downloaded, trimmed, segment.trim_duration)
+                local_segments.append(trimmed)
+                timeline_position += _probe_duration(trimmed)
+            else:
+                local_segments.append(downloaded)
+                timeline_position += _probe_duration(downloaded)
+
+        combined = temp_dir / "combined.m4a"
+        _concat_audio_segments(local_segments, combined, max(stream.duration, timeline_position))
         shutil.copy2(combined, partial_path)
 
     os.replace(partial_path, output_path)
@@ -1679,17 +2289,86 @@ def _normalize_speaker_source(source: Path, destination: Path) -> None:
     )
 
 
+def _mix_audio_streams(
+    speaker_path: Path,
+    audio_streams: Sequence[AudioStream],
+    audio_sources: Dict[str, Path],
+    destination: Path,
+    duration: float,
+) -> None:
+    """Смешать основной звук камеры с аудио участников по временной шкале."""
+
+    if not audio_streams:
+        raise DownloadError("Для микширования не передан ни один аудиопоток.")
+
+    input_args: List[str] = ["-i", str(speaker_path)]
+    filters = ["[0:a:0]aresample=48000,asetpts=PTS-STARTPTS[main]"]
+    mix_inputs = ["[main]"]
+    for index, stream in enumerate(audio_streams, start=1):
+        source = audio_sources.get(stream.key)
+        if not source or not source.exists():
+            raise DownloadError(f"Не найден локальный файл аудиопотока: {stream.title}")
+        input_args.extend(["-i", str(source)])
+        label = f"participant{index}"
+        delay_ms = max(0, int(round(stream.start_time * 1000)))
+        filters.append(
+            f"[{index}:a:0]aresample=48000,asetpts=PTS-STARTPTS,"
+            f"adelay={delay_ms}:all=1[{label}]"
+        )
+        mix_inputs.append(f"[{label}]")
+    filters.append(
+        "".join(mix_inputs)
+        + f"amix=inputs={len(mix_inputs)}:duration=first:dropout_transition=0:"
+        "normalize=1,aresample=async=1:first_pts=0[mixed]"
+    )
+    _run_ffmpeg(
+        [
+            *input_args,
+            "-filter_complex",
+            ";".join(filters),
+            "-map",
+            "[mixed]",
+            "-vn",
+            "-t",
+            f"{duration:.3f}",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-movflags",
+            "+faststart",
+            "-y",
+            str(destination),
+        ],
+        "Микширование аудио спикера и участников",
+    )
+
+
 def _render_speaker_segment(
-    speaker_path: Path, segment: CompositeSegment, destination: Path
+    speaker_path: Path,
+    segment: CompositeSegment,
+    destination: Path,
+    audio_path: Optional[Path] = None,
 ) -> None:
     """Перекодировать участок, где спикер является основным изображением."""
 
+    input_args = [
+        "-ss",
+        f"{segment.start_time:.3f}",
+        "-i",
+        str(speaker_path),
+    ]
+    audio_index = 0
+    if audio_path and audio_path != speaker_path:
+        input_args.extend(["-i", str(audio_path)])
+        audio_index = 1
     _run_ffmpeg(
         [
-            "-ss",
-            f"{segment.start_time:.3f}",
-            "-i",
-            str(speaker_path),
+            *input_args,
             "-t",
             f"{segment.duration:.3f}",
             "-vf",
@@ -1697,7 +2376,7 @@ def _render_speaker_segment(
             "-map",
             "0:v:0",
             "-map",
-            "0:a:0?",
+            f"{audio_index}:a:0?",
             *_video_encode_args(),
             str(destination),
         ],
@@ -1711,6 +2390,7 @@ def _render_material_segment(
     background_path: Path,
     destination: Path,
     background_offset: float = 0.0,
+    audio_path: Optional[Path] = None,
 ) -> None:
     """Создать участок материала с PiP спикера и его аудио.
 
@@ -1744,6 +2424,10 @@ def _render_material_segment(
             "-i",
             str(speaker_path),
         ]
+    audio_index = 1
+    if audio_path and audio_path != speaker_path:
+        input_args.extend(["-i", str(audio_path)])
+        audio_index = 2
     filter_complex = (
         f"[0:v]{_fit_video_filter()}[background];"
         f"[1:v]{_pip_filter()}[speaker];"
@@ -1758,7 +2442,7 @@ def _render_material_segment(
             "-map",
             "[v]",
             "-map",
-            "1:a:0?",
+            f"{audio_index}:a:0?",
             "-t",
             duration,
             *_video_encode_args(),
@@ -1787,6 +2471,8 @@ def download_composite(
     overwrite: bool,
     speaker_source: Optional[Path] = None,
     screen_source: Optional[Path] = None,
+    audio_streams: Sequence[AudioStream] = (),
+    audio_sources: Optional[Dict[str, Path]] = None,
 ) -> Path:
     """Собрать синхронный MP4 из камеры, презентации и screen share.
 
@@ -1794,6 +2480,8 @@ def download_composite(
 
     * камера скачивается (если не передан ``speaker_source``) и становится
       источником непрерывного аудио;
+    * отдельные аудиосессии участников скачиваются и микшируются с камерой
+      по их исходным relativeTime;
     * screen share скачивается (если не передан ``screen_source``) как активный
       отдельный видеопоток;
     * уникальные JPG слайдов скачиваются по presentation.update;
@@ -1840,6 +2528,35 @@ def download_composite(
         normalized_speaker_path = temp_dir / "speaker-source-normalized.mp4"
         _normalize_speaker_source(speaker_path, normalized_speaker_path)
 
+        local_audio_sources: Dict[str, Path] = {}
+        supplied_audio_sources = audio_sources or {}
+        for audio_stream in audio_streams:
+            supplied = supplied_audio_sources.get(audio_stream.key)
+            if supplied is not None:
+                if not supplied.exists():
+                    raise DownloadError(f"Не найден локальный файл аудиопотока: {supplied}")
+                local_audio_sources[audio_stream.key] = supplied
+            else:
+                local_audio = temp_dir / f"{audio_stream.key}.m4a"
+                download_audio_stream(
+                    page_info=page_info,
+                    stream=audio_stream,
+                    output_path=local_audio,
+                    overwrite=True,
+                )
+                local_audio_sources[audio_stream.key] = local_audio
+
+        mixed_audio_path = normalized_speaker_path
+        if audio_streams:
+            mixed_audio_path = temp_dir / "speaker-and-participants.m4a"
+            _mix_audio_streams(
+                speaker_path=normalized_speaker_path,
+                audio_streams=audio_streams,
+                audio_sources=local_audio_sources,
+                destination=mixed_audio_path,
+                duration=duration,
+            )
+
         screen_path: Optional[Path] = None
         if screen_stream:
             if screen_source is None:
@@ -1864,7 +2581,12 @@ def download_composite(
         for index, segment in enumerate(timeline, start=1):
             rendered = temp_dir / f"segment-{index:04d}.mp4"
             if segment.kind == "speaker":
-                _render_speaker_segment(normalized_speaker_path, segment, rendered)
+                _render_speaker_segment(
+                    normalized_speaker_path,
+                    segment,
+                    rendered,
+                    audio_path=mixed_audio_path,
+                )
             elif segment.kind == "presentation":
                 if not segment.image_url or segment.image_url not in image_paths:
                     raise DownloadError(
@@ -1875,6 +2597,7 @@ def download_composite(
                     normalized_speaker_path,
                     image_paths[segment.image_url],
                     rendered,
+                    audio_path=mixed_audio_path,
                 )
             else:
                 if not screen_path or not screen_stream:
@@ -1885,6 +2608,7 @@ def download_composite(
                     screen_path,
                     rendered,
                     background_offset=max(0.0, segment.start_time - screen_stream.start_time),
+                    audio_path=mixed_audio_path,
                 )
             rendered_segments.append(rendered)
 
@@ -1903,6 +2627,7 @@ def download_composite(
 def download_full_package(
     page_info: RecordingPage,
     streams: Sequence[VideoStream],
+    audio_streams: Sequence[AudioStream],
     presentations: Sequence[PresentationStream],
     total_duration: float,
     output_dir: Path,
@@ -1922,6 +2647,7 @@ def download_full_package(
     output_dir.mkdir(parents=True, exist_ok=True)
     results: List[Path] = []
     local_video_paths: Dict[str, Path] = {}
+    local_audio_paths: Dict[str, Path] = {}
 
     # Сначала создаём полный комплект отдельных видео. Порядок совпадает с
     # прежним режимом A: сначала камера, затем screen share.
@@ -1940,6 +2666,26 @@ def download_full_package(
             overwrite=overwrite,
         )
         local_video_paths[stream.key] = result
+        results.append(result)
+
+    # Отдельные микрофоны слушателей сохраняются в M4A. Их временные позиции
+    # затем используются при сборке combined.mp4, а сами файлы остаются в
+    # полном комплекте для независимого прослушивания.
+    for audio_stream in audio_streams:
+        output_path = audio_output_path(
+            output_dir=output_dir,
+            filename=filename,
+            title=title,
+            session_id=session_id,
+            stream=audio_stream,
+        )
+        result = download_audio_stream(
+            page_info=page_info,
+            stream=audio_stream,
+            output_path=output_path,
+            overwrite=overwrite,
+        )
+        local_audio_paths[audio_stream.key] = result
         results.append(result)
 
     # PDF остаётся отдельным исходным материалом и не заменяется слайдовым
@@ -1983,6 +2729,8 @@ def download_full_package(
             overwrite=overwrite,
             speaker_source=local_video_paths["speaker"],
             screen_source=local_video_paths.get("screen-share"),
+            audio_streams=audio_streams,
+            audio_sources=local_audio_paths,
         )
     )
     return results
@@ -2060,14 +2808,18 @@ async def async_main(args: argparse.Namespace) -> int:
     # Из одного JSON строим две модели: видео-сегменты и презентационные
     # события. Это отражает реальную структуру API, где презентация не
     # является mediasession.
-    streams, total_duration = extract_video_streams(record)
+    streams, audio_streams, total_duration = _extract_media_streams(record)
     enrich_video_streams(streams, total_duration)
+    enrich_audio_streams(audio_streams)
     presentations = extract_presentation_streams(record, total_duration)
     # Нумерация для пользователя идёт по времени старта, поэтому презентация
     # оказывается между камерой и поздним screen share.
     available_streams: List[SelectableStream] = sorted(
-        [*streams, *presentations],
-        key=lambda stream: (stream.start_time, 0 if isinstance(stream, VideoStream) else 1),
+        [*streams, *audio_streams, *presentations],
+        key=lambda stream: (
+            stream.start_time,
+            0 if isinstance(stream, VideoStream) else 1 if isinstance(stream, AudioStream) else 2,
+        ),
     )
     print_stream_catalog(available_streams, total_duration)
     if args.dry_run:
@@ -2084,6 +2836,7 @@ async def async_main(args: argparse.Namespace) -> int:
         results = download_full_package(
             page_info=page_info,
             streams=streams,
+            audio_streams=audio_streams,
             presentations=presentations,
             total_duration=total_duration,
             output_dir=args.output_dir,
@@ -2122,6 +2875,7 @@ async def async_main(args: argparse.Namespace) -> int:
             total_duration=total_duration,
             output_path=output_path,
             overwrite=args.overwrite,
+            audio_streams=audio_streams,
         )
         print("\nВыбрано: сводное видео", flush=True)
         print(result, flush=True)
@@ -2143,6 +2897,20 @@ async def async_main(args: argparse.Namespace) -> int:
                 stream=stream,
             )
             result = download_stream(
+                page_info=page_info,
+                stream=stream,
+                output_path=output_path,
+                overwrite=args.overwrite,
+            )
+        elif isinstance(stream, AudioStream):
+            output_path = audio_output_path(
+                output_dir=args.output_dir,
+                filename=args.filename,
+                title=title,
+                session_id=page_info.session_id,
+                stream=stream,
+            )
+            result = download_audio_stream(
                 page_info=page_info,
                 stream=stream,
                 output_path=output_path,
