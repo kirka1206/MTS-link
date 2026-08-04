@@ -5,8 +5,10 @@ from unittest.mock import patch
 from download_mts_link import (
     _add_missing_streams,
     _parse_stream_selection,
+    _render_speaker_segment,
     build_composite_timeline,
     choose_download_plan,
+    CompositeSegment,
     extract_audio_streams,
     extract_media_segments,
     extract_presentation_streams,
@@ -283,6 +285,25 @@ class RecordingParsingTests(unittest.TestCase):
         args = run_ffmpeg.call_args.args[0]
         self.assertIn("color=c=black:s=1280x720:r=30:d=30.000", args)
         self.assertIn("1:a:0", args)
+
+    def test_composite_seeks_global_mixed_audio_with_video_segment(self):
+        segment = CompositeSegment(kind="speaker", start_time=75.0, duration=5.0)
+
+        with patch("download_mts_link._run_ffmpeg") as run_ffmpeg:
+            _render_speaker_segment(
+                Path("speaker.mp4"),
+                segment,
+                Path("rendered.mp4"),
+                audio_path=Path("mixed-audio.m4a"),
+            )
+
+        args = run_ffmpeg.call_args.args[0]
+        # Один seek относится к видео камеры, второй — к глобальной дорожке
+        # mixed-аудио. Оба должны начинаться с позиции текущего участка.
+        self.assertEqual(args.count("-ss"), 2)
+        self.assertEqual(args[args.index("-ss") + 1], "75.000")
+        second_seek = args.index("-ss", args.index("-ss") + 1)
+        self.assertEqual(args[second_seek + 1], "75.000")
 
 
 if __name__ == "__main__":

@@ -2364,7 +2364,10 @@ def _render_speaker_segment(
     ]
     audio_index = 0
     if audio_path and audio_path != speaker_path:
-        input_args.extend(["-i", str(audio_path)])
+        # mixed-аудио содержит всю запись целиком. Для текущего фрагмента
+        # нужно перемотать его к той же позиции, что и видео спикера; иначе
+        # каждый участок composite начинал бы звук снова с 00:00:00.
+        input_args.extend(["-ss", f"{segment.start_time:.3f}", "-i", str(audio_path)])
         audio_index = 1
     _run_ffmpeg(
         [
@@ -2426,7 +2429,9 @@ def _render_material_segment(
         ]
     audio_index = 1
     if audio_path and audio_path != speaker_path:
-        input_args.extend(["-i", str(audio_path)])
+        # Аналогично ветке speaker: дополнительный звук является глобальной
+        # дорожкой записи и должен читаться с позиции текущего участка.
+        input_args.extend(["-ss", f"{segment.start_time:.3f}", "-i", str(audio_path)])
         audio_index = 2
     filter_complex = (
         f"[0:v]{_fit_video_filter()}[background];"
