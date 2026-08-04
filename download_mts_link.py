@@ -15,8 +15,10 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from urllib.error import URLError
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
@@ -65,6 +67,26 @@ class VideoStream:
     @property
     def end_time(self) -> float:
         return self.start_time + self.duration
+
+
+@dataclass
+class PresentationStream:
+    """A presentation source represented by presentation events, not a video file."""
+
+    key: str
+    title: str
+    file_name: str
+    source_url: str
+    start_time: float
+    duration: float
+    slide_count: int
+
+    @property
+    def end_time(self) -> float:
+        return self.start_time + self.duration
+
+
+SelectableStream = Union[VideoStream, PresentationStream]
 
 
 def parse_recording_page(url: str) -> RecordingPage:
@@ -229,6 +251,137 @@ def extract_video_streams(record: Dict[str, Any]) -> Tuple[List[VideoStream], fl
     return streams, max(0.0, total_duration)
 
 
+def extract_presentation_streams(
+    record: Dict[str, Any], total_duration: float = 0.0
+) -> List[PresentationStream]:
+    """Extract presentation files and the intervals when they were displayed.
+
+    MTS Link emits presentation changes as ``presentation.update`` events.  A
+    presentation therefore has no ``mediasession`` URL and cannot be handled
+    by the video segment downloader.  The file URL in the event points to the
+    original PDF, which is the lossless representation of this source.
+    """
+
+    event_logs = record.get("eventLogs") or []
+    if not isinstance(event_logs, list):
+        return []
+
+    groups: Dict[str, Dict[str, Any]] = {}
+    for event in event_logs:
+        if not isinstance(event, dict) or event.get("module") != "presentation.update":
+            continue
+        data = event.get("data")
+        if not isinstance(data, dict):
+            continue
+        file_reference = data.get("fileReference")
+        if not isinstance(file_reference, dict):
+            continue
+        presentation_file = file_reference.get("file")
+        if not isinstance(presentation_file, dict):
+            continue
+
+        source_url = presentation_file.get("downloadUrl") or presentation_file.get("url")
+        if not isinstance(source_url, str) or not source_url.startswith(("http://", "https://")):
+            continue
+
+        try:
+            relative_time = max(0.0, float(event.get("relativeTime", 0.0)))
+        except (TypeError, ValueError):
+            continue
+
+        group_key = str(presentation_file.get("id") or source_url)
+        group = groups.setdefault(
+            group_key,
+            {
+                "name": str(presentation_file.get("name") or "presentation.pdf"),
+                "source_url": source_url,
+                "events": [],
+                "slides": presentation_file.get("slides"),
+                "displayed_slides": set(),
+            },
+        )
+        group["events"].append((relative_time, data.get("isActive")))
+        displayed_slide = file_reference.get("slide")
+        if isinstance(displayed_slide, dict) and displayed_slide.get("name"):
+            group["displayed_slides"].add(str(displayed_slide["name"]))
+        if not group.get("slides") and isinstance(presentation_file.get("slides"), list):
+            group["slides"] = presentation_file["slides"]
+
+    # If a recording ends without a final presentation.update(false), use the
+    # next screen-share start as the best available end of the presentation.
+    fallback_end = total_duration if total_duration > 0 else 0.0
+    for event in event_logs:
+        if not isinstance(event, dict) or event.get("module") != "mediasession.add":
+            continue
+        data = event.get("data")
+        if _stream_key(data) != "screen-share":
+            continue
+        try:
+            screen_start = max(0.0, float(event.get("relativeTime", 0.0)))
+        except (TypeError, ValueError):
+            continue
+        fallback_end = screen_start if fallback_end <= 0 else min(fallback_end, screen_start)
+
+    presentations: List[PresentationStream] = []
+    for index, group in enumerate(groups.values(), start=1):
+        events = sorted(group["events"], key=lambda item: item[0])
+        if not events:
+            continue
+
+        intervals: List[Tuple[float, float]] = []
+        active_start: Optional[float] = None
+        for relative_time, is_active in events:
+            if is_active is False:
+                if active_start is not None and relative_time >= active_start:
+                    intervals.append((active_start, relative_time))
+                    active_start = None
+                continue
+            if active_start is None:
+                active_start = relative_time
+
+        if active_start is not None:
+            end_time = fallback_end or events[-1][0]
+            if end_time > active_start:
+                intervals.append((active_start, end_time))
+
+        if intervals:
+            start_time = min(start for start, _ in intervals)
+            end_time = max(end for _, end in intervals)
+            duration = sum(end - start for start, end in intervals)
+        else:
+            start_time = events[0][0]
+            end_time = events[-1][0]
+            duration = max(0.0, end_time - start_time)
+
+        slides = group.get("slides")
+        if isinstance(slides, list):
+            slide_count = sum(1 for slide in slides if isinstance(slide, dict))
+        else:
+            slide_count = 0
+
+        # In some recordings ``file.slides`` contains only the current slide,
+        # while the update events reveal the rest of the deck over time.
+        slide_count = max(slide_count, len(group.get("displayed_slides") or set()))
+
+        key = "presentation" if index == 1 else f"presentation-{index}"
+        title = "Демонстрация презентации"
+        if len(groups) > 1:
+            title = f"{title}: {group['name']}"
+        presentations.append(
+            PresentationStream(
+                key=key,
+                title=title,
+                file_name=group["name"],
+                source_url=group["source_url"],
+                start_time=start_time,
+                duration=max(0.0, duration),
+                slide_count=slide_count,
+            )
+        )
+
+    return presentations
+
+
 def extract_media_segments(record: Dict[str, Any]) -> Tuple[List[MediaSegment], float]:
     """Backward-compatible helper returning the speaker stream only."""
 
@@ -250,6 +403,18 @@ def _safe_filename(name: str, fallback: str) -> str:
     name = re.sub(r"[\\/:*?\"<>|\x00-\x1f]", "_", name).strip(" .")
     name = re.sub(r"\s+", " ", name)
     return (name or fallback)[:180] + ".mp4"
+
+
+def _output_stem(
+    output_dir: Path, filename: Optional[str], title: str, session_id: int
+) -> Path:
+    if filename:
+        supplied = Path(filename)
+        parent = supplied.parent if supplied.is_absolute() else output_dir
+        stem = supplied.stem if supplied.suffix else supplied.name
+        return parent / stem
+    safe_title = _safe_filename(title, f"mts-link-{session_id}")[:-4]
+    return output_dir / safe_title
 
 
 def _probe_remote_media(url: str) -> Dict[str, Any]:
@@ -317,29 +482,42 @@ def enrich_video_streams(streams: Sequence[VideoStream], total_duration: float) 
         stream.duration = max(0.0, segment_duration)
 
 
-def print_stream_catalog(streams: Sequence[VideoStream], total_duration: float) -> None:
-    print("Доступные видеопотоки:", flush=True)
+def print_stream_catalog(
+    streams: Sequence[SelectableStream], total_duration: float
+) -> None:
+    print("Доступные потоки и источники записи:", flush=True)
     for index, stream in enumerate(streams, start=1):
-        codec = stream.codec or "не определён"
-        size = (
-            f"{stream.width}x{stream.height}"
-            if stream.width and stream.height
-            else "размер неизвестен"
-        )
-        audio = "видео + звук" if stream.has_audio else "только видео"
-        duration = _format_duration(stream.duration) if stream.duration else "не определена"
-        interval_end = stream.end_time if stream.duration else stream.start_time
-        interval = f"{_format_duration(stream.start_time)}–{_format_duration(interval_end)}"
-        if stream.key == "speaker" and total_duration:
-            interval = f"00:00:00–{_format_duration(total_duration)}"
         print(f"\n{index}. {stream.title}", flush=True)
-        print(f"   формат: {codec}, {size}, {audio}", flush=True)
-        print(
-            f"   частей: {len(stream.segments)}, активная длительность: {duration}",
-            flush=True,
-        )
+        if isinstance(stream, VideoStream):
+            codec = stream.codec or "не определён"
+            size = (
+                f"{stream.width}x{stream.height}"
+                if stream.width and stream.height
+                else "размер неизвестен"
+            )
+            audio = "видео + звук" if stream.has_audio else "только видео"
+            duration = (
+                _format_duration(stream.duration) if stream.duration else "не определена"
+            )
+            interval_end = stream.end_time if stream.duration else stream.start_time
+            interval = f"{_format_duration(stream.start_time)}–{_format_duration(interval_end)}"
+            if stream.key == "speaker" and total_duration:
+                interval = f"00:00:00–{_format_duration(total_duration)}"
+            print(f"   формат: {codec}, {size}, {audio}", flush=True)
+            print(
+                f"   частей: {len(stream.segments)}, активная длительность: {duration}",
+                flush=True,
+            )
+        else:
+            duration = _format_duration(stream.duration) if stream.duration else "не определена"
+            interval = f"{_format_duration(stream.start_time)}–{_format_duration(stream.end_time)}"
+            print("   формат: PDF / слайды", flush=True)
+            print(
+                f"   уникальных слайдов в журнале: {stream.slide_count}, активная длительность: {duration}",
+                flush=True,
+            )
         print(f"   положение в записи: {interval}", flush=True)
-    print("\nA. Все потоки", flush=True)
+    print("\nA. Все потоки и источники", flush=True)
 
 
 def _parse_stream_selection(value: str, stream_count: int) -> List[int]:
@@ -364,11 +542,19 @@ def _parse_stream_selection(value: str, stream_count: int) -> List[int]:
 def choose_video_streams(
     streams: Sequence[VideoStream], requested: Optional[str]
 ) -> List[VideoStream]:
+    return choose_streams(streams, requested)  # type: ignore[return-value]
+
+
+def choose_streams(
+    streams: Sequence[SelectableStream], requested: Optional[str]
+) -> List[SelectableStream]:
     if requested is not None:
         try:
             indexes = _parse_stream_selection(requested, len(streams))
         except (TypeError, ValueError):
-            raise DownloadError("Некорректный --streams. Используйте all или номера, например 1,2.")
+            raise DownloadError(
+                "Некорректный --streams. Используйте all или номера, например 1,2."
+            )
         return [streams[index] for index in indexes]
 
     if not sys.stdin.isatty():
@@ -377,7 +563,7 @@ def choose_video_streams(
 
     while True:
         try:
-            value = input("\nВведите A для всех потоков или номера через запятую: ")
+            value = input("\nВведите A для всех источников или номера через запятую: ")
             indexes = _parse_stream_selection(value, len(streams))
             return [streams[index] for index in indexes]
         except (TypeError, ValueError):
@@ -472,6 +658,26 @@ def _download_source(segment: MediaSegment, destination: Path, referer: str) -> 
     if last_error:
         raise DownloadError(f"Не удалось скачать ни один источник для сегмента: {last_error}")
     raise DownloadError("Для сегмента отсутствует URL источника.")
+
+
+def _download_file(source_url: str, destination: Path, referer: str) -> None:
+    """Download a non-video asset, such as the original presentation PDF."""
+
+    parsed_referer = urlparse(referer)
+    request = Request(
+        source_url,
+        headers={
+            "Referer": referer,
+            "Origin": f"{parsed_referer.scheme}://{parsed_referer.netloc}",
+            "User-Agent": "Mozilla/5.0",
+        },
+    )
+    try:
+        with urlopen(request, timeout=120) as response, destination.open("wb") as output:
+            shutil.copyfileobj(response, output, length=1024 * 1024)
+    except (OSError, URLError) as exc:
+        destination.unlink(missing_ok=True)
+        raise DownloadError(f"Не удалось скачать файл презентации: {exc}") from exc
 
 
 def _trim_tail(source: Path, destination: Path, seconds: float) -> None:
@@ -614,14 +820,19 @@ def stream_output_path(
     session_id: int,
     stream: VideoStream,
 ) -> Path:
-    suffix = f"-{stream.key}.mp4"
-    if filename:
-        supplied = Path(filename)
-        parent = supplied.parent if supplied.is_absolute() else output_dir
-        stem = supplied.stem if supplied.suffix else supplied.name
-        return parent / f"{stem}{suffix}"
-    safe_title = _safe_filename(title, f"mts-link-{session_id}")[:-4]
-    return output_dir / f"{safe_title}{suffix}"
+    stem = _output_stem(output_dir, filename, title, session_id)
+    return stem.with_name(f"{stem.name}-{stream.key}.mp4")
+
+
+def presentation_output_path(
+    output_dir: Path,
+    filename: Optional[str],
+    title: str,
+    session_id: int,
+    stream: PresentationStream,
+) -> Path:
+    stem = _output_stem(output_dir, filename, title, session_id)
+    return stem.with_name(f"{stem.name}-{stream.key}.pdf")
 
 
 def download_stream(
@@ -666,6 +877,32 @@ def download_stream(
     os.replace(partial_path, output_path)
     actual_duration = _probe_duration(output_path)
     LOG.info("Готово: %s (%s)", output_path, _format_duration(actual_duration))
+    return output_path
+
+
+def download_presentation(
+    page_info: RecordingPage,
+    stream: PresentationStream,
+    output_path: Path,
+    overwrite: bool,
+) -> Path:
+    """Download the original PDF represented by presentation.update events."""
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists() and not overwrite:
+        raise DownloadError(
+            f"Файл уже существует: {output_path}. Добавьте --overwrite для перезаписи."
+        )
+
+    partial_path = output_path.with_name(output_path.name + ".part")
+    partial_path.unlink(missing_ok=True)
+    LOG.info("Скачивание презентации «%s»", stream.file_name)
+    _download_file(stream.source_url, partial_path, page_info.url)
+    if not partial_path.exists() or partial_path.stat().st_size == 0:
+        partial_path.unlink(missing_ok=True)
+        raise DownloadError("Сервис вернул пустой файл презентации.")
+    os.replace(partial_path, output_path)
+    LOG.info("Готово: %s (%.1f МБ)", output_path, output_path.stat().st_size / 1024 / 1024)
     return output_path
 
 
@@ -720,31 +957,51 @@ async def async_main(args: argparse.Namespace) -> int:
     record = await analyze_page(page_info, headed=args.headed)
     streams, total_duration = extract_video_streams(record)
     enrich_video_streams(streams, total_duration)
-    print_stream_catalog(streams, total_duration)
+    presentations = extract_presentation_streams(record, total_duration)
+    available_streams: List[SelectableStream] = sorted(
+        [*streams, *presentations],
+        key=lambda stream: (stream.start_time, 0 if isinstance(stream, VideoStream) else 1),
+    )
+    print_stream_catalog(available_streams, total_duration)
     if args.dry_run:
         return 0
 
-    selected_streams = choose_video_streams(streams, args.streams)
+    selected_streams = choose_streams(available_streams, args.streams)
     title = str(record.get("name") or f"mts-link-{page_info.session_id}")
     print(
-        "\nВыбрано потоков:",
+        "\nВыбрано источников:",
         ", ".join(stream.title for stream in selected_streams),
         flush=True,
     )
     for stream in selected_streams:
-        output_path = stream_output_path(
-            output_dir=args.output_dir,
-            filename=args.filename,
-            title=title,
-            session_id=page_info.session_id,
-            stream=stream,
-        )
-        result = download_stream(
-            page_info=page_info,
-            stream=stream,
-            output_path=output_path,
-            overwrite=args.overwrite,
-        )
+        if isinstance(stream, VideoStream):
+            output_path = stream_output_path(
+                output_dir=args.output_dir,
+                filename=args.filename,
+                title=title,
+                session_id=page_info.session_id,
+                stream=stream,
+            )
+            result = download_stream(
+                page_info=page_info,
+                stream=stream,
+                output_path=output_path,
+                overwrite=args.overwrite,
+            )
+        else:
+            output_path = presentation_output_path(
+                output_dir=args.output_dir,
+                filename=args.filename,
+                title=title,
+                session_id=page_info.session_id,
+                stream=stream,
+            )
+            result = download_presentation(
+                page_info=page_info,
+                stream=stream,
+                output_path=output_path,
+                overwrite=args.overwrite,
+            )
         print(result, flush=True)
     return 0
 

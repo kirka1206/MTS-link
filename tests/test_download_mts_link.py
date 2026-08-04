@@ -3,6 +3,7 @@ import unittest
 from download_mts_link import (
     _parse_stream_selection,
     extract_media_segments,
+    extract_presentation_streams,
     extract_video_streams,
     parse_recording_page,
 )
@@ -86,6 +87,54 @@ class RecordingParsingTests(unittest.TestCase):
         self.assertEqual([stream.key for stream in streams], ["speaker", "screen-share"])
         self.assertEqual(streams[1].start_time, 100.0)
         self.assertEqual(streams[1].segments[0].source_url, "https://storage/screen.mp4")
+
+    def test_extracts_presentation_update_as_a_separate_source(self):
+        record = {
+            "duration": 120.0,
+            "eventLogs": [
+                {
+                    "module": "presentation.update",
+                    "relativeTime": 5.0,
+                    "data": {
+                        "isActive": True,
+                        "fileReference": {
+                            "file": {
+                                "id": 10,
+                                "name": "deck.pdf",
+                                "downloadUrl": "https://storage/deck.pdf",
+                                "slides": [{"name": "slide-1"}, {"name": "slide-2"}],
+                            },
+                            "slide": {"name": "slide-1"},
+                        },
+                    },
+                },
+                {
+                    "module": "presentation.update",
+                    "relativeTime": 50.0,
+                    "data": {
+                        "isActive": False,
+                        "fileReference": {
+                            "file": {
+                                "id": 10,
+                                "name": "deck.pdf",
+                                "downloadUrl": "https://storage/deck.pdf",
+                                "slides": [{"name": "slide-1"}, {"name": "slide-2"}],
+                            },
+                            "slide": {"name": "slide-2"},
+                        },
+                    },
+                },
+            ],
+        }
+
+        presentations = extract_presentation_streams(record, total_duration=120.0)
+
+        self.assertEqual(len(presentations), 1)
+        self.assertEqual(presentations[0].key, "presentation")
+        self.assertEqual(presentations[0].source_url, "https://storage/deck.pdf")
+        self.assertEqual(presentations[0].start_time, 5.0)
+        self.assertEqual(presentations[0].duration, 45.0)
+        self.assertEqual(presentations[0].slide_count, 2)
 
 
 if __name__ == "__main__":
