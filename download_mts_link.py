@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -13,7 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from urllib.error import URLError
@@ -70,6 +71,14 @@ class VideoStream:
 
 
 @dataclass
+class PresentationUpdate:
+    relative_time: float
+    is_active: bool
+    image_url: Optional[str] = None
+    slide_name: Optional[str] = None
+
+
+@dataclass
 class PresentationStream:
     """A presentation source represented by presentation events, not a video file."""
 
@@ -80,10 +89,19 @@ class PresentationStream:
     start_time: float
     duration: float
     slide_count: int
+    updates: List[PresentationUpdate] = field(default_factory=list)
 
     @property
     def end_time(self) -> float:
         return self.start_time + self.duration
+
+
+@dataclass
+class CompositeSegment:
+    kind: str
+    start_time: float
+    duration: float
+    image_url: Optional[str] = None
 
 
 SelectableStream = Union[VideoStream, PresentationStream]
@@ -300,10 +318,25 @@ def extract_presentation_streams(
                 "displayed_slides": set(),
             },
         )
-        group["events"].append((relative_time, data.get("isActive")))
         displayed_slide = file_reference.get("slide")
+        slide_url: Optional[str] = None
+        slide_name: Optional[str] = None
         if isinstance(displayed_slide, dict) and displayed_slide.get("name"):
-            group["displayed_slides"].add(str(displayed_slide["name"]))
+            slide_name = str(displayed_slide["name"])
+            group["displayed_slides"].add(slide_name)
+            candidate_slide_url = displayed_slide.get("downloadUrl") or displayed_slide.get("url")
+            if isinstance(candidate_slide_url, str) and candidate_slide_url.startswith(
+                ("http://", "https://")
+            ):
+                slide_url = candidate_slide_url
+        group["events"].append(
+            PresentationUpdate(
+                relative_time=relative_time,
+                is_active=data.get("isActive") is not False,
+                image_url=slide_url,
+                slide_name=slide_name,
+            )
+        )
         if not group.get("slides") and isinstance(presentation_file.get("slides"), list):
             group["slides"] = presentation_file["slides"]
 
@@ -324,23 +357,23 @@ def extract_presentation_streams(
 
     presentations: List[PresentationStream] = []
     for index, group in enumerate(groups.values(), start=1):
-        events = sorted(group["events"], key=lambda item: item[0])
+        events = sorted(group["events"], key=lambda item: item.relative_time)
         if not events:
             continue
 
         intervals: List[Tuple[float, float]] = []
         active_start: Optional[float] = None
-        for relative_time, is_active in events:
-            if is_active is False:
-                if active_start is not None and relative_time >= active_start:
-                    intervals.append((active_start, relative_time))
+        for update in events:
+            if not update.is_active:
+                if active_start is not None and update.relative_time >= active_start:
+                    intervals.append((active_start, update.relative_time))
                     active_start = None
                 continue
             if active_start is None:
-                active_start = relative_time
+                active_start = update.relative_time
 
         if active_start is not None:
-            end_time = fallback_end or events[-1][0]
+            end_time = fallback_end or events[-1].relative_time
             if end_time > active_start:
                 intervals.append((active_start, end_time))
 
@@ -349,8 +382,8 @@ def extract_presentation_streams(
             end_time = max(end for _, end in intervals)
             duration = sum(end - start for start, end in intervals)
         else:
-            start_time = events[0][0]
-            end_time = events[-1][0]
+            start_time = events[0].relative_time
+            end_time = events[-1].relative_time
             duration = max(0.0, end_time - start_time)
 
         slides = group.get("slides")
@@ -376,6 +409,7 @@ def extract_presentation_streams(
                 start_time=start_time,
                 duration=max(0.0, duration),
                 slide_count=slide_count,
+                updates=events,
             )
         )
 
@@ -518,6 +552,7 @@ def print_stream_catalog(
             )
         print(f"   положение в записи: {interval}", flush=True)
     print("\nA. Все потоки и источники", flush=True)
+    print("C. Сводное видео: материалы + спикер в правом верхнем углу", flush=True)
 
 
 def _parse_stream_selection(value: str, stream_count: int) -> List[int]:
@@ -568,6 +603,41 @@ def choose_streams(
             return [streams[index] for index in indexes]
         except (TypeError, ValueError):
             print("Не удалось распознать выбор. Пример: A или 1,2.")
+
+
+def choose_download_plan(
+    streams: Sequence[SelectableStream],
+    requested: Optional[str],
+    composite_requested: bool = False,
+) -> Tuple[bool, List[SelectableStream]]:
+    """Return (composite_mode, selected_streams) while keeping old choices."""
+
+    if composite_requested and requested is not None:
+        raise DownloadError("--composite нельзя использовать вместе с --streams.")
+    if composite_requested:
+        return True, list(streams)
+
+    if requested is not None:
+        if requested.strip().lower() in {"c", "composite", "сводное", "сводное видео"}:
+            return True, list(streams)
+        return False, choose_streams(streams, requested)
+
+    if not sys.stdin.isatty():
+        LOG.info("Интерактивный выбор недоступен, выбираю все потоки.")
+        return False, list(streams)
+
+    while True:
+        try:
+            value = input(
+                "\nВведите C для сводного видео, A для всех источников "
+                "или номера через запятую: "
+            ).strip()
+            if value.lower() in {"c", "composite", "сводное", "сводное видео"}:
+                return True, list(streams)
+            indexes = _parse_stream_selection(value, len(streams))
+            return False, [streams[index] for index in indexes]
+        except (TypeError, ValueError):
+            print("Не удалось распознать выбор. Пример: C, A или 1,2.")
 
 
 def _ffmpeg_path() -> str:
@@ -906,6 +976,323 @@ def download_presentation(
     return output_path
 
 
+COMPOSITE_WIDTH = 1280
+COMPOSITE_HEIGHT = 720
+COMPOSITE_PIP_WIDTH = 320
+COMPOSITE_MARGIN = 16
+COMPOSITE_FPS = 25
+
+
+def _presentation_image_at(
+    presentations: Sequence[PresentationStream], relative_time: float
+) -> Optional[str]:
+    for presentation in presentations:
+        current_image: Optional[str] = None
+        for update in presentation.updates:
+            if update.relative_time > relative_time:
+                break
+            if not update.is_active:
+                current_image = None
+            elif update.image_url:
+                current_image = update.image_url
+        if current_image:
+            return current_image
+    return None
+
+
+def build_composite_timeline(
+    total_duration: float,
+    presentations: Sequence[PresentationStream],
+    screen_stream: Optional[VideoStream],
+) -> List[CompositeSegment]:
+    """Build the material timeline from MTS Link event timestamps."""
+
+    if total_duration <= 0:
+        return []
+
+    boundaries = {0.0, total_duration}
+    for presentation in presentations:
+        boundaries.add(max(0.0, min(total_duration, presentation.start_time)))
+        boundaries.add(max(0.0, min(total_duration, presentation.end_time)))
+        for update in presentation.updates:
+            if 0.0 < update.relative_time < total_duration:
+                boundaries.add(update.relative_time)
+    if screen_stream and screen_stream.duration > 0:
+        boundaries.add(max(0.0, min(total_duration, screen_stream.start_time)))
+        boundaries.add(max(0.0, min(total_duration, screen_stream.end_time)))
+
+    ordered = sorted(boundaries)
+    segments: List[CompositeSegment] = []
+    for start_time, end_time in zip(ordered, ordered[1:]):
+        duration = end_time - start_time
+        if duration <= 0.05:
+            continue
+        midpoint = start_time + duration / 2
+        image_url = _presentation_image_at(presentations, midpoint)
+        if (
+            screen_stream
+            and screen_stream.duration > 0
+            and screen_stream.start_time <= midpoint < screen_stream.end_time
+        ):
+            kind = "screen"
+            image_url = None
+        elif image_url:
+            kind = "presentation"
+        else:
+            kind = "speaker"
+
+        if (
+            segments
+            and segments[-1].kind == kind
+            and segments[-1].image_url == image_url
+            and abs(segments[-1].start_time + segments[-1].duration - start_time) < 0.01
+        ):
+            segments[-1].duration += duration
+        else:
+            segments.append(
+                CompositeSegment(
+                    kind=kind,
+                    start_time=start_time,
+                    duration=duration,
+                    image_url=image_url,
+                )
+            )
+    return segments
+
+
+def _download_composite_slide_images(
+    presentations: Sequence[PresentationStream], temp_dir: Path, referer: str
+) -> Dict[str, Path]:
+    image_paths: Dict[str, Path] = {}
+    for presentation in presentations:
+        for update in presentation.updates:
+            if not update.image_url or update.image_url in image_paths:
+                continue
+            digest = hashlib.sha256(update.image_url.encode("utf-8")).hexdigest()[:16]
+            destination = temp_dir / f"slide-{digest}.jpg"
+            _download_file(update.image_url, destination, referer)
+            if not destination.exists() or destination.stat().st_size == 0:
+                raise DownloadError(f"Не удалось получить изображение слайда «{update.slide_name or digest}».")
+            image_paths[update.image_url] = destination
+    return image_paths
+
+
+def _fit_video_filter(width: int = COMPOSITE_WIDTH, height: int = COMPOSITE_HEIGHT) -> str:
+    return (
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
+    )
+
+
+def _pip_filter() -> str:
+    return (
+        f"scale={COMPOSITE_PIP_WIDTH}:-2:force_original_aspect_ratio=decrease,"
+        f"pad={COMPOSITE_PIP_WIDTH}:{COMPOSITE_PIP_WIDTH * 9 // 16}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
+    )
+
+
+def _video_encode_args() -> List[str]:
+    return [
+        "-r",
+        str(COMPOSITE_FPS),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "20",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-ar",
+        "48000",
+        "-ac",
+        "2",
+        "-af",
+        "aresample=async=1:first_pts=0",
+        "-avoid_negative_ts",
+        "make_zero",
+        "-y",
+    ]
+
+
+def _render_speaker_segment(
+    speaker_path: Path, segment: CompositeSegment, destination: Path
+) -> None:
+    _run_ffmpeg(
+        [
+            "-ss",
+            f"{segment.start_time:.3f}",
+            "-i",
+            str(speaker_path),
+            "-t",
+            f"{segment.duration:.3f}",
+            "-vf",
+            _fit_video_filter(),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            *_video_encode_args(),
+            str(destination),
+        ],
+        f"Подготовка участка лекции ({_format_duration(segment.duration)})",
+    )
+
+
+def _render_material_segment(
+    segment: CompositeSegment,
+    speaker_path: Path,
+    background_path: Path,
+    destination: Path,
+    background_offset: float = 0.0,
+) -> None:
+    duration = f"{segment.duration:.3f}"
+    if segment.kind == "presentation":
+        input_args = [
+            "-loop",
+            "1",
+            "-framerate",
+            str(COMPOSITE_FPS),
+            "-i",
+            str(background_path),
+            "-ss",
+            f"{segment.start_time:.3f}",
+            "-i",
+            str(speaker_path),
+        ]
+    else:
+        input_args = [
+            "-ss",
+            f"{background_offset:.3f}",
+            "-i",
+            str(background_path),
+            "-ss",
+            f"{segment.start_time:.3f}",
+            "-i",
+            str(speaker_path),
+        ]
+    filter_complex = (
+        f"[0:v]{_fit_video_filter()}[background];"
+        f"[1:v]{_pip_filter()}[speaker];"
+        "[background][speaker]overlay="
+        f"main_w-overlay_w-{COMPOSITE_MARGIN}:{COMPOSITE_MARGIN}:format=auto[v]"
+    )
+    _run_ffmpeg(
+        [
+            *input_args,
+            "-filter_complex",
+            filter_complex,
+            "-map",
+            "[v]",
+            "-map",
+            "1:a:0?",
+            "-t",
+            duration,
+            *_video_encode_args(),
+            str(destination),
+        ],
+        f"Наложение спикера ({_format_duration(segment.duration)})",
+    )
+
+
+def composite_output_path(
+    output_dir: Path, filename: Optional[str], title: str, session_id: int
+) -> Path:
+    stem = _output_stem(output_dir, filename, title, session_id)
+    return stem.with_name(f"{stem.name}-combined.mp4")
+
+
+def download_composite(
+    page_info: RecordingPage,
+    speaker_stream: VideoStream,
+    screen_stream: Optional[VideoStream],
+    presentations: Sequence[PresentationStream],
+    total_duration: float,
+    output_path: Path,
+    overwrite: bool,
+) -> Path:
+    """Create one synchronized video with material and speaker PiP."""
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists() and not overwrite:
+        raise DownloadError(
+            f"Файл уже существует: {output_path}. Добавьте --overwrite для перезаписи."
+        )
+
+    duration = total_duration or speaker_stream.duration
+    timeline = build_composite_timeline(duration, presentations, screen_stream)
+    if not timeline:
+        raise DownloadError("Не удалось построить временную шкалу сводного видео.")
+
+    partial_path = output_path.with_name(output_path.name + ".part")
+    partial_path.unlink(missing_ok=True)
+    LOG.info(
+        "Сборка сводного видео: %d участков, разрешение %dx%d",
+        len(timeline),
+        COMPOSITE_WIDTH,
+        COMPOSITE_HEIGHT,
+    )
+
+    with tempfile.TemporaryDirectory(prefix="mts-link-composite-") as temp_name:
+        temp_dir = Path(temp_name)
+        speaker_path = temp_dir / "speaker-source.mp4"
+        download_stream(page_info, speaker_stream, speaker_path, overwrite=True)
+
+        screen_path: Optional[Path] = None
+        if screen_stream:
+            screen_path = temp_dir / "screen-source.mp4"
+            download_stream(page_info, screen_stream, screen_path, overwrite=True)
+
+        slides_dir = temp_dir / "slides"
+        slides_dir.mkdir(exist_ok=True)
+        image_paths = (
+            _download_composite_slide_images(presentations, slides_dir, page_info.url)
+            if presentations
+            else {}
+        )
+
+        rendered_segments: List[Path] = []
+        for index, segment in enumerate(timeline, start=1):
+            rendered = temp_dir / f"segment-{index:04d}.mp4"
+            if segment.kind == "speaker":
+                _render_speaker_segment(speaker_path, segment, rendered)
+            elif segment.kind == "presentation":
+                if not segment.image_url or segment.image_url not in image_paths:
+                    raise DownloadError(
+                        "Для презентации не найдено изображение слайда, необходимое для сводного видео."
+                    )
+                _render_material_segment(
+                    segment,
+                    speaker_path,
+                    image_paths[segment.image_url],
+                    rendered,
+                )
+            else:
+                if not screen_path or not screen_stream:
+                    raise DownloadError("Временная шкала содержит screen share без его файла.")
+                _render_material_segment(
+                    segment,
+                    speaker_path,
+                    screen_path,
+                    rendered,
+                    background_offset=max(0.0, segment.start_time - screen_stream.start_time),
+                )
+            rendered_segments.append(rendered)
+
+        combined = temp_dir / "combined.mp4"
+        _concat_segments(rendered_segments, combined, duration)
+        shutil.copy2(combined, partial_path)
+
+    os.replace(partial_path, output_path)
+    actual_duration = _probe_duration(output_path)
+    LOG.info("Готово: %s (%s)", output_path, _format_duration(actual_duration))
+    return output_path
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Скачать полную запись с публичной страницы МТС Линк."
@@ -916,13 +1303,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir",
         type=Path,
         default=Path("downloads"),
-        help="Папка для итогового MP4 (по умолчанию: downloads)",
+        help="Папка для итоговых файлов (по умолчанию: downloads)",
     )
     parser.add_argument(
         "-f",
         "--filename",
         type=str,
-        help="Имя итогового файла; расширение .mp4 добавится автоматически",
+        help="Общее имя файлов; суффикс и расширение добавятся автоматически",
     )
     parser.add_argument(
         "--headed",
@@ -941,7 +1328,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--streams",
-        help="Потоки для скачивания: all или номера через запятую, например 1,2",
+        help="Потоки для скачивания: all, номера через запятую или composite",
+    )
+    parser.add_argument(
+        "--composite",
+        action="store_true",
+        help="Собрать презентацию, screen share и спикера в одно MP4 с PiP",
     )
     parser.add_argument(
         "-v",
@@ -966,8 +1358,40 @@ async def async_main(args: argparse.Namespace) -> int:
     if args.dry_run:
         return 0
 
-    selected_streams = choose_streams(available_streams, args.streams)
+    composite_mode, selected_streams = choose_download_plan(
+        available_streams,
+        args.streams,
+        composite_requested=args.composite,
+    )
     title = str(record.get("name") or f"mts-link-{page_info.session_id}")
+    if composite_mode:
+        speaker_stream = next(
+            (stream for stream in streams if stream.key == "speaker"), None
+        )
+        if not speaker_stream:
+            raise DownloadError("Для сводного видео не найден поток спикера.")
+        screen_stream = next(
+            (stream for stream in streams if stream.key == "screen-share"), None
+        )
+        output_path = composite_output_path(
+            output_dir=args.output_dir,
+            filename=args.filename,
+            title=title,
+            session_id=page_info.session_id,
+        )
+        result = download_composite(
+            page_info=page_info,
+            speaker_stream=speaker_stream,
+            screen_stream=screen_stream,
+            presentations=presentations,
+            total_duration=total_duration,
+            output_path=output_path,
+            overwrite=args.overwrite,
+        )
+        print("\nВыбрано: сводное видео", flush=True)
+        print(result, flush=True)
+        return 0
+
     print(
         "\nВыбрано источников:",
         ", ".join(stream.title for stream in selected_streams),

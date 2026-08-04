@@ -2,9 +2,14 @@ import unittest
 
 from download_mts_link import (
     _parse_stream_selection,
+    build_composite_timeline,
+    choose_download_plan,
     extract_media_segments,
     extract_presentation_streams,
     extract_video_streams,
+    PresentationStream,
+    PresentationUpdate,
+    VideoStream,
     parse_recording_page,
 )
 
@@ -21,6 +26,16 @@ class RecordingParsingTests(unittest.TestCase):
         self.assertEqual(_parse_stream_selection("all", 3), [0, 1, 2])
         self.assertEqual(_parse_stream_selection("1,3", 3), [0, 2])
         self.assertEqual(_parse_stream_selection("1-2", 3), [0, 1])
+
+    def test_composite_choice_is_available_without_removing_old_selection(self):
+        streams = [object(), object()]
+        composite, selected = choose_download_plan(streams, "C")
+        self.assertTrue(composite)
+        self.assertEqual(selected, streams)
+
+        composite, selected = choose_download_plan(streams, "1")
+        self.assertFalse(composite)
+        self.assertEqual(selected, [streams[0]])
 
     def test_extracts_main_segments_and_trims_initial_preroll(self):
         record = {
@@ -135,6 +150,45 @@ class RecordingParsingTests(unittest.TestCase):
         self.assertEqual(presentations[0].start_time, 5.0)
         self.assertEqual(presentations[0].duration, 45.0)
         self.assertEqual(presentations[0].slide_count, 2)
+
+    def test_composite_timeline_uses_presentation_and_screen_share_order(self):
+        presentation = PresentationStream(
+            key="presentation",
+            title="Демонстрация презентации",
+            file_name="deck.pdf",
+            source_url="https://storage/deck.pdf",
+            start_time=3.0,
+            duration=5.0,
+            slide_count=1,
+            updates=[
+                PresentationUpdate(
+                    relative_time=3.0,
+                    is_active=True,
+                    image_url="https://storage/slide.jpg",
+                ),
+                PresentationUpdate(relative_time=8.0, is_active=False),
+            ],
+        )
+        screen = VideoStream(
+            key="screen-share",
+            title="Расшаренный экран",
+            segments=[],
+            duration=5.0,
+            start_time=10.0,
+        )
+
+        timeline = build_composite_timeline(20.0, [presentation], screen)
+
+        self.assertEqual(
+            [(item.kind, item.start_time, item.duration) for item in timeline],
+            [
+                ("speaker", 0.0, 3.0),
+                ("presentation", 3.0, 5.0),
+                ("speaker", 8.0, 2.0),
+                ("screen", 10.0, 5.0),
+                ("speaker", 15.0, 5.0),
+            ],
+        )
 
 
 if __name__ == "__main__":
