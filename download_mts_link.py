@@ -889,6 +889,124 @@ def _probe_stream_types(path: Path) -> set:
     return {line.strip() for line in completed.stdout.splitlines() if line.strip()}
 
 
+def _add_missing_streams(
+    source: Path,
+    destination: Path,
+    stream: VideoStream,
+) -> Path:
+    """Восстановить отсутствующую дорожку в одном физическом сегменте.
+
+    Иногда сервис сохраняет участок конференции только с аудио: например,
+    камера временно не передавала кадры, но микрофон продолжал работать.
+    Обратная ситуация тоже возможна — видео есть, а аудиодорожка в конкретном
+    сегменте отсутствует. Такие файлы нельзя надёжно объединять с соседями
+    через concat demuxer, потому что у сегментов получается разный набор
+    потоков.
+
+    Для аудио-only участка создаём чёрный видеоряд с разрешением камеры. Для
+    video-only участка добавляем тишину. Перекодируется только проблемный
+    короткий/единичный сегмент; нормальные исходные сегменты остаются без
+    перекодирования. Возвращается ``destination`` для заменяемого локального
+    файла.
+    """
+
+    stream_types = _probe_stream_types(source)
+    has_video = "video" in stream_types
+    has_audio = "audio" in stream_types
+    if has_video and (has_audio or not stream.has_audio):
+        return source
+    if not has_video and not has_audio:
+        raise DownloadError(f"Сегмент {source.name} не содержит ни видео, ни звука.")
+
+    duration = _probe_duration(source)
+    if duration <= 0:
+        raise DownloadError(f"Не удалось определить длительность сегмента {source.name}.")
+
+    width = stream.width or 1280
+    height = stream.height or 720
+    video_size = f"{width}x{height}"
+    common_output = [
+        "-t",
+        f"{duration:.3f}",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "18",
+        "-pix_fmt",
+        "yuv420p",
+        "-r",
+        str(NORMALIZED_SOURCE_FPS),
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-ar",
+        "48000",
+        "-ac",
+        "2",
+        "-max_interleave_delta",
+        "0",
+        "-avoid_negative_ts",
+        "make_zero",
+        "-movflags",
+        "+faststart",
+        "-y",
+        str(destination),
+    ]
+
+    if not has_video:
+        # Видео отсутствует, но аудио есть. Ограничиваем генерацию чёрного
+        # фона той же длительностью, чтобы он не стал бесконечным входом.
+        LOG.warning(
+            "Сегмент %s содержит только звук; добавляю чёрный видеоряд %sx%s",
+            source.name,
+            width,
+            height,
+        )
+        _run_ffmpeg(
+            [
+                "-f",
+                "lavfi",
+                "-i",
+                f"color=c=black:s={video_size}:r={NORMALIZED_SOURCE_FPS}:d={duration:.3f}",
+                "-i",
+                str(source),
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                *common_output,
+            ],
+            f"Добавление отсутствующего видео к сегменту {source.name}",
+        )
+    else:
+        # Видео есть, но для конференции нет звука. Добавляем тишину, чтобы
+        # итоговый speaker-файл сохранил непрерывную аудиодорожку.
+        LOG.warning(
+            "Сегмент %s содержит только видео; добавляю тишину",
+            source.name,
+        )
+        _run_ffmpeg(
+            [
+                "-f",
+                "lavfi",
+                "-i",
+                f"anullsrc=r=48000:cl=stereo",
+                "-i",
+                str(source),
+                "-map",
+                "1:v:0",
+                "-map",
+                "0:a:0",
+                *common_output,
+            ],
+            f"Добавление отсутствующего звука к сегменту {source.name}",
+        )
+    return destination
+
+
 def _download_source(segment: MediaSegment, destination: Path, referer: str) -> None:
     """Скачать MP4/HLS-сегмент через ffmpeg.
 
@@ -900,6 +1018,7 @@ def _download_source(segment: MediaSegment, destination: Path, referer: str) -> 
     headers = f"Referer: {referer}\r\nOrigin: {urlparse(referer).scheme}://{urlparse(referer).netloc}\r\n"
     candidates = [url for url in (segment.source_url, segment.hls_url) if url]
     last_error: Optional[Exception] = None
+    audio_only_backup: Optional[Path] = None
 
     for source_url in candidates:
         try:
@@ -910,8 +1029,10 @@ def _download_source(segment: MediaSegment, destination: Path, referer: str) -> 
                     headers,
                     "-i",
                     source_url,
+                    # Знак вопроса позволяет скачать и audio-only сегмент:
+                    # позже _add_missing_streams добавит к нему чёрное видео.
                     "-map",
-                    "0:v:0",
+                    "0:v:0?",
                     "-map",
                     "0:a:0?",
                     "-c",
@@ -928,7 +1049,20 @@ def _download_source(segment: MediaSegment, destination: Path, referer: str) -> 
                 # видеопоток: повреждённый/неполный MP4 может быть ненулевым.
                 stream_types = _probe_stream_types(destination)
                 if "video" in stream_types:
+                    if audio_only_backup:
+                        audio_only_backup.unlink(missing_ok=True)
                     return
+                if "audio" in stream_types:
+                    LOG.warning(
+                        "Источник содержит только аудио; проверяю запасной URL на наличие видео"
+                    )
+                    # Не отбрасываем аудио-only кандидат: если HLS также не
+                    # содержит видео, он всё равно нужен для сохранения звука.
+                    audio_only_backup = destination.with_name(
+                        destination.name + ".audio-only"
+                    )
+                    shutil.copy2(destination, audio_only_backup)
+                    continue
                 LOG.warning(
                     "Источник создал файл без видеопотока (%s), пробую следующий URL",
                     ", ".join(sorted(stream_types)) or "потоки отсутствуют",
@@ -936,6 +1070,17 @@ def _download_source(segment: MediaSegment, destination: Path, referer: str) -> 
         except (DownloadError, OSError) as exc:
             last_error = exc
             LOG.warning("Источник не скачан, пробую запасной вариант: %s", source_url)
+
+    if audio_only_backup:
+        # Оба URL могут описывать один и тот же audio-only участок. В таком
+        # случае возвращаем сохранённый звук, а вызывающий код добавит к нему
+        # чёрное видео и продолжит сборку полного потока.
+        destination.unlink(missing_ok=True)
+        os.replace(audio_only_backup, destination)
+        LOG.warning(
+            "Видеопоток отсутствует во всех источниках; сохраняю аудио и добавлю чёрное видео"
+        )
+        return
 
     if last_error:
         raise DownloadError(f"Не удалось скачать ни один источник для сегмента: {last_error}")
@@ -1243,12 +1388,24 @@ def download_stream(
         for index, segment in enumerate(segments, start=1):
             downloaded = temp_dir / f"source-{index:03d}.mp4"
             _download_source(segment, downloaded, page_info.url)
+
+            # Для conference-потока сервер иногда отдаёт сегмент только с
+            # аудио. Перед concat приводим такой сегмент к тому же набору
+            # дорожек, что и соседние части: звук сохраняется, а вместо
+            # отсутствующей картинки появляется чёрный видеоряд. Это важно
+            # не только для отдельного MP4, но и для последующего composite,
+            # где аудио спикера должно продолжаться без провала.
+            prepared = _add_missing_streams(
+                downloaded,
+                temp_dir / f"source-{index:03d}-prepared.mp4",
+                stream,
+            )
             if index == 1 and segment.trim_duration is not None:
                 trimmed = temp_dir / "source-001-trimmed.mp4"
-                _trim_tail(downloaded, trimmed, segment.trim_duration)
+                _trim_tail(prepared, trimmed, segment.trim_duration)
                 local_segments.append(trimmed)
             else:
-                local_segments.append(downloaded)
+                local_segments.append(prepared)
 
         # Склеиваем только после обработки всех частей: так ошибка одного
         # сегмента не оставляет пользователю правдоподобный, но неполный MP4.

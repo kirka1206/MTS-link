@@ -1,6 +1,9 @@
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from download_mts_link import (
+    _add_missing_streams,
     _parse_stream_selection,
     build_composite_timeline,
     choose_download_plan,
@@ -193,6 +196,33 @@ class RecordingParsingTests(unittest.TestCase):
                 ("speaker", 15.0, 5.0),
             ],
         )
+
+    def test_audio_only_segment_gets_black_video_track(self):
+        stream = VideoStream(
+            key="speaker",
+            title="Спикер / камера",
+            segments=[],
+            duration=30.0,
+            start_time=0.0,
+            width=1280,
+            height=720,
+            has_audio=True,
+        )
+        source = Path("audio-only.mp4")
+        destination = Path("audio-only-prepared.mp4")
+
+        # Здесь не запускаем ffmpeg: проверяем именно выбор ветки и параметры
+        # восстановления. Реальный аудио-only сегмент дополнительно проверен
+        # вручную на URL записи из пользовательского журнала.
+        with patch("download_mts_link._probe_stream_types", return_value={"audio"}), \
+             patch("download_mts_link._probe_duration", return_value=30.0), \
+             patch("download_mts_link._run_ffmpeg") as run_ffmpeg:
+            result = _add_missing_streams(source, destination, stream)
+
+        self.assertEqual(result, destination)
+        args = run_ffmpeg.call_args.args[0]
+        self.assertIn("color=c=black:s=1280x720:r=30:d=30.000", args)
+        self.assertIn("1:a:0", args)
 
 
 if __name__ == "__main__":
