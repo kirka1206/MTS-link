@@ -1,5 +1,28 @@
 #!/usr/bin/env python3
-"""Download a complete recording from an MTS Link public recording page."""
+"""Скачивание и сборка записей с публичной страницы МТС Линк.
+
+Скрипт работает в несколько независимых этапов:
+
+1. ``analyze_page`` открывает страницу через Playwright и получает JSON-запись
+   из API МТС Линк. Это позволяет использовать те же актуальные ссылки и
+   временные метки, которые использует веб-плеер.
+2. ``extract_video_streams`` разбирает ``mediasession`` и группирует файлы
+   камеры/спикера и screen share. Один логический поток может состоять из
+   нескольких последовательных MP4-сегментов.
+3. ``extract_presentation_streams`` отдельно разбирает события
+   ``presentation.update``. Презентация в МТС Линк не является H.264-потоком:
+   API сообщает PDF и изображения активных слайдов.
+4. Каталог позволяет сохранить каждый источник отдельно или выбрать режим
+   ``C``/``--composite``. В этом режиме строится общая временная шкала,
+   слайды превращаются в видеоряд, а видео и аудио спикера накладываются на
+   демонстрируемые материалы.
+5. Все временные файлы создаются в ``TemporaryDirectory`` и удаляются после
+   завершения. Итоговый файл сначала записывается с суффиксом ``.part`` и
+   переименовывается в конечное имя только после успешной сборки.
+
+Для работы нужны Python из виртуального окружения, Playwright/Chromium и
+внешние программы ``ffmpeg`` и ``ffprobe``.
+"""
 
 from __future__ import annotations
 
@@ -34,11 +57,13 @@ RECORD_PATH_RE = re.compile(
 
 
 class DownloadError(RuntimeError):
-    """A user-facing download error."""
+    """Ошибка, которую можно безопасно показать пользователю в терминале."""
 
 
 @dataclass
 class RecordingPage:
+    """Разобранные параметры страницы записи и соответствующего API-запроса."""
+
     url: str
     session_id: int
     api_url: str
@@ -46,6 +71,13 @@ class RecordingPage:
 
 @dataclass
 class MediaSegment:
+    """Один физический видеофайл внутри логического видеопотока.
+
+    ``relative_time`` — момент начала сегмента относительно всей записи.
+    ``trim_duration`` используется только для первого файла камеры: в нём
+    иногда присутствует преролл до фактического начала записи.
+    """
+
     source_url: str
     hls_url: Optional[str]
     relative_time: float
@@ -55,6 +87,8 @@ class MediaSegment:
 
 @dataclass
 class VideoStream:
+    """Логический видеопоток, собранный из одного или нескольких сегментов."""
+
     key: str
     title: str
     segments: List[MediaSegment]
@@ -67,11 +101,15 @@ class VideoStream:
 
     @property
     def end_time(self) -> float:
+        """Вернуть момент окончания активной части потока в записи."""
+
         return self.start_time + self.duration
 
 
 @dataclass
 class PresentationUpdate:
+    """Одно событие смены состояния или текущего слайда презентации."""
+
     relative_time: float
     is_active: bool
     image_url: Optional[str] = None
@@ -80,7 +118,12 @@ class PresentationUpdate:
 
 @dataclass
 class PresentationStream:
-    """A presentation source represented by presentation events, not a video file."""
+    """Презентационный источник, описанный событиями, а не видеофайлом.
+
+    ``source_url`` ведёт на исходный PDF для отдельного скачивания.
+    ``updates`` содержит URL изображений слайдов и временные метки, поэтому
+    эти же данные можно использовать для формирования сводного MP4.
+    """
 
     key: str
     title: str
@@ -93,11 +136,20 @@ class PresentationStream:
 
     @property
     def end_time(self) -> float:
+        """Вернуть правую границу общего интервала показа презентации."""
+
         return self.start_time + self.duration
 
 
 @dataclass
 class CompositeSegment:
+    """Участок итогового ролика с одним типом основного изображения.
+
+    ``kind`` принимает значения ``speaker``, ``presentation`` или ``screen``.
+    Для презентации ``image_url`` указывает на конкретный слайд; для остальных
+    типов он не используется.
+    """
+
     kind: str
     start_time: float
     duration: float
@@ -108,6 +160,13 @@ SelectableStream = Union[VideoStream, PresentationStream]
 
 
 def parse_recording_page(url: str) -> RecordingPage:
+    """Проверить URL записи и построить адрес API с её описанием.
+
+    Здесь намеренно поддерживается только публичный формат ``/j/...``.
+    Идентификатор сессии берётся из последнего сегмента URL; организация и
+    ``event_id`` нужны для проверки формата, но в API-запросе не используются.
+    """
+
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise DownloadError("URL должен начинаться с http:// или https://.")
@@ -128,6 +187,13 @@ def parse_recording_page(url: str) -> RecordingPage:
 
 
 def _stream_key(value: Any) -> Optional[str]:
+    """Определить тип media-session по флагам из JSON МТС Линк.
+
+    В API камера/микрофон обозначены ключом ``conference``, а экранная
+    демонстрация — ключом ``screensharing``. Неизвестные типы пропускаются,
+    чтобы не ошибочно принять служебный ресурс за видеопоток.
+    """
+
     if not isinstance(value, dict):
         return None
     stream = value.get("stream") or {}
@@ -143,6 +209,12 @@ def _stream_key(value: Any) -> Optional[str]:
 def _media_segment(
     value: Dict[str, Any], relative_time: float, initial: bool
 ) -> Optional[MediaSegment]:
+    """Преобразовать одну запись ``mediasession`` в безопасную модель.
+
+    У сегмента может быть прямой MP4 URL, HLS URL или оба варианта. Прямой
+    MP4 используется первым, а HLS остаётся резервным вариантом для ffmpeg.
+    """
+
     if not _stream_key(value):
         return None
 
@@ -173,10 +245,16 @@ def extract_video_streams(record: Dict[str, Any]) -> Tuple[List[VideoStream], fl
     speaker/camera stream, while screen sharing is kept as its own stream.
     """
 
+    # В журнале есть snapshots и последующие события добавления сегментов.
+    # Нельзя просто взять все mediasession из всех snapshots: один и тот же
+    # сегмент тогда попадёт в итог несколько раз.
     event_logs = record.get("eventLogs") or []
     if not isinstance(event_logs, list):
         raise DownloadError("Ответ МТС Линк содержит некорректный журнал записи.")
 
+    # Snapshot даёт первый файл каждого типа. Он может содержать несколько
+    # секунд до нулевой точки записи, поэтому позже для него рассчитывается
+    # trim_duration.
     initial_by_key: Dict[str, MediaSegment] = {}
     for event in event_logs:
         if not isinstance(event, dict):
@@ -192,6 +270,7 @@ def extract_video_streams(record: Dict[str, Any]) -> Tuple[List[VideoStream], fl
             if candidate and key and key not in initial_by_key:
                 initial_by_key[key] = candidate
 
+    # Реальные последующие части приходят отдельными mediasession.add.
     additions_by_key: Dict[str, List[MediaSegment]] = {}
     for event in event_logs:
         if not isinstance(event, dict) or event.get("module") != "mediasession.add":
@@ -209,6 +288,8 @@ def extract_video_streams(record: Dict[str, Any]) -> Tuple[List[VideoStream], fl
         if candidate and key:
             additions_by_key.setdefault(key, []).append(candidate)
 
+    # Порядок здесь влияет только на внутренний список. В пользовательском
+    # каталоге потоки дополнительно сортируются по моменту начала.
     stream_names = {
         "speaker": ("Спикер / камера", True),
         "screen-share": ("Расшаренный экран", False),
@@ -225,6 +306,8 @@ def extract_video_streams(record: Dict[str, Any]) -> Tuple[List[VideoStream], fl
                 segments.append(initial)
                 seen.add(initial_source)
 
+        # Удаляем повторные URL: API может прислать повторное событие для уже
+        # известного сегмента после обновления состояния плеера.
         for candidate in additions:
             candidate_source = candidate.source_url or candidate.hls_url
             if not candidate_source or candidate_source in seen:
@@ -257,6 +340,8 @@ def extract_video_streams(record: Dict[str, Any]) -> Tuple[List[VideoStream], fl
             "Возможно, запись удалена или доступ к ней ограничен."
         )
 
+    # Полная длительность записи относится к камере/спикеру, даже если
+    # screen share или презентация активны только в отдельном интервале.
     try:
         total_duration = float(record.get("duration") or 0.0)
     except (TypeError, ValueError):
@@ -284,6 +369,9 @@ def extract_presentation_streams(
     if not isinstance(event_logs, list):
         return []
 
+    # Одна презентация может породить десятки presentation.update — по одному
+    # на каждый переход между слайдами. Группируем их по ID файла, чтобы в
+    # каталоге показывать один источник, а не десятки псевдопотоков.
     groups: Dict[str, Dict[str, Any]] = {}
     for event in event_logs:
         if not isinstance(event, dict) or event.get("module") != "presentation.update":
@@ -298,6 +386,8 @@ def extract_presentation_streams(
         if not isinstance(presentation_file, dict):
             continue
 
+        # downloadUrl предпочтительнее: это ссылка на исходный PDF. Если её
+        # нет, используем обычный URL файла как запасной вариант.
         source_url = presentation_file.get("downloadUrl") or presentation_file.get("url")
         if not isinstance(source_url, str) or not source_url.startswith(("http://", "https://")):
             continue
@@ -329,6 +419,8 @@ def extract_presentation_streams(
                 ("http://", "https://")
             ):
                 slide_url = candidate_slide_url
+        # Сохраняем не только имя слайда, но и картинку: именно её можно
+        # подать в ffmpeg без дополнительного рендеринга PDF.
         group["events"].append(
             PresentationUpdate(
                 relative_time=relative_time,
@@ -340,8 +432,10 @@ def extract_presentation_streams(
         if not group.get("slides") and isinstance(presentation_file.get("slides"), list):
             group["slides"] = presentation_file["slides"]
 
-    # If a recording ends without a final presentation.update(false), use the
-    # next screen-share start as the best available end of the presentation.
+    # Если запись закончилась без финального presentation.update(false),
+    # используем начало screen share или конец записи как верхнюю границу.
+    # Это защищает от ошибочного растягивания последнего слайда до конца
+    # двухчасовой записи.
     fallback_end = total_duration if total_duration > 0 else 0.0
     for event in event_logs:
         if not isinstance(event, dict) or event.get("module") != "mediasession.add":
@@ -361,6 +455,9 @@ def extract_presentation_streams(
         if not events:
             continue
 
+        # Презентация может включаться и выключаться несколько раз. Храним
+        # интервалы отдельно, чтобы active duration была суммой активных
+        # участков, а положение в записи — общей внешней границей.
         intervals: List[Tuple[float, float]] = []
         active_start: Optional[float] = None
         for update in events:
@@ -392,8 +489,8 @@ def extract_presentation_streams(
         else:
             slide_count = 0
 
-        # In some recordings ``file.slides`` contains only the current slide,
-        # while the update events reveal the rest of the deck over time.
+        # В некоторых записях file.slides содержит только текущий слайд, а
+        # полный набор можно восстановить по update-событиям.
         slide_count = max(slide_count, len(group.get("displayed_slides") or set()))
 
         key = "presentation" if index == 1 else f"presentation-{index}"
@@ -417,7 +514,11 @@ def extract_presentation_streams(
 
 
 def extract_media_segments(record: Dict[str, Any]) -> Tuple[List[MediaSegment], float]:
-    """Backward-compatible helper returning the speaker stream only."""
+    """Вернуть сегменты камеры для старого кода, использовавшего эту функцию.
+
+    Новая логика работает через ``extract_video_streams`` и знает о screen
+    share, но оставляем этот адаптер, чтобы внешние вызовы не ломались.
+    """
 
     streams, duration = extract_video_streams(record)
     speaker = next((stream for stream in streams if stream.key == "speaker"), None)
@@ -427,6 +528,8 @@ def extract_media_segments(record: Dict[str, Any]) -> Tuple[List[MediaSegment], 
 
 
 def _format_duration(seconds: float) -> str:
+    """Отформатировать секунды как ``HH:MM:SS`` для каталога и логов."""
+
     seconds = max(0, int(seconds))
     hours, remainder = divmod(seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
@@ -434,6 +537,8 @@ def _format_duration(seconds: float) -> str:
 
 
 def _safe_filename(name: str, fallback: str) -> str:
+    """Удалить опасные для файловой системы символы из названия записи."""
+
     name = re.sub(r"[\\/:*?\"<>|\x00-\x1f]", "_", name).strip(" .")
     name = re.sub(r"\s+", " ", name)
     return (name or fallback)[:180] + ".mp4"
@@ -442,6 +547,13 @@ def _safe_filename(name: str, fallback: str) -> str:
 def _output_stem(
     output_dir: Path, filename: Optional[str], title: str, session_id: int
 ) -> Path:
+    """Определить общий путь без суффикса потока и расширения.
+
+    Один stem используется для трёх типов результатов: ``-speaker.mp4``,
+    ``-presentation.pdf`` и ``-combined.mp4``. Поэтому расширение входного
+    ``--filename`` здесь намеренно не сохраняется.
+    """
+
     if filename:
         supplied = Path(filename)
         parent = supplied.parent if supplied.is_absolute() else output_dir
@@ -452,7 +564,12 @@ def _output_stem(
 
 
 def _probe_remote_media(url: str) -> Dict[str, Any]:
-    """Read lightweight codec/size/duration metadata without downloading media."""
+    """Получить codec, разрешение и длительность удалённого media-файла.
+
+    ffprobe читает контейнерные метаданные через URL и не сохраняет весь файл
+    локально. Если источник временно недоступен, возвращается пустой словарь:
+    скачивание позже всё равно попробует этот URL и резервный HLS-вариант.
+    """
 
     completed = subprocess.run(
         [
@@ -488,7 +605,12 @@ def _probe_remote_media(url: str) -> Dict[str, Any]:
 
 
 def enrich_video_streams(streams: Sequence[VideoStream], total_duration: float) -> None:
-    """Add codec, resolution and duration data used by the interactive catalog."""
+    """Заполнить метаданные, которые выводятся в интерактивном каталоге.
+
+    Для камеры длительность берётся из записи целиком. Для screen share она
+    вычисляется как сумма длительностей его физических сегментов, потому что
+    такой поток занимает только часть исходной записи.
+    """
 
     for stream in streams:
         first_url = stream.segments[0].source_url or stream.segments[0].hls_url
@@ -519,6 +641,8 @@ def enrich_video_streams(streams: Sequence[VideoStream], total_duration: float) 
 def print_stream_catalog(
     streams: Sequence[SelectableStream], total_duration: float
 ) -> None:
+    """Напечатать нумерованный каталог видео, презентаций и режима C."""
+
     print("Доступные потоки и источники записи:", flush=True)
     for index, stream in enumerate(streams, start=1):
         print(f"\n{index}. {stream.title}", flush=True)
@@ -556,6 +680,12 @@ def print_stream_catalog(
 
 
 def _parse_stream_selection(value: str, stream_count: int) -> List[int]:
+    """Разобрать ``A``, список номеров или диапазоны в нулевые индексы.
+
+    Например, ``1,3`` превращается в ``[0, 2]``, а ``1-3`` — в ``[0, 1, 2]``.
+    Дубли удаляются, сохраняя порядок первого появления.
+    """
+
     normalized = value.strip().lower()
     if normalized in {"", "a", "all", "все", "*"}:
         return list(range(stream_count))
@@ -577,12 +707,16 @@ def _parse_stream_selection(value: str, stream_count: int) -> List[int]:
 def choose_video_streams(
     streams: Sequence[VideoStream], requested: Optional[str]
 ) -> List[VideoStream]:
+    """Старый типизированный адаптер выбора только видеопотоков."""
+
     return choose_streams(streams, requested)  # type: ignore[return-value]
 
 
 def choose_streams(
     streams: Sequence[SelectableStream], requested: Optional[str]
 ) -> List[SelectableStream]:
+    """Выбрать отдельные источники по CLI-значению или через prompt."""
+
     if requested is not None:
         try:
             indexes = _parse_stream_selection(requested, len(streams))
@@ -610,7 +744,13 @@ def choose_download_plan(
     requested: Optional[str],
     composite_requested: bool = False,
 ) -> Tuple[bool, List[SelectableStream]]:
-    """Return (composite_mode, selected_streams) while keeping old choices."""
+    """Вернуть план скачивания: composite-режим и выбранные источники.
+
+    ``--composite`` и буква ``C`` означают, что список отдельных потоков не
+    скачивается как пользовательский результат: он используется как вход для
+    автоматической сборки одного MP4. ``A`` и номера сохраняют прежнее
+    поведение.
+    """
 
     if composite_requested and requested is not None:
         raise DownloadError("--composite нельзя использовать вместе с --streams.")
@@ -641,6 +781,8 @@ def choose_download_plan(
 
 
 def _ffmpeg_path() -> str:
+    """Найти ffmpeg и выдать понятную ошибку, если он не установлен."""
+
     path = shutil.which("ffmpeg")
     if not path:
         raise DownloadError(
@@ -651,6 +793,8 @@ def _ffmpeg_path() -> str:
 
 
 def _ffprobe_path() -> str:
+    """Найти ffprobe, обычно устанавливаемый вместе с ffmpeg."""
+
     path = shutil.which("ffprobe")
     if not path:
         raise DownloadError(
@@ -660,6 +804,13 @@ def _ffprobe_path() -> str:
 
 
 def _run_ffmpeg(args: Sequence[str], description: str) -> None:
+    """Запустить ffmpeg с общими безопасными параметрами.
+
+    ``-nostdin`` нужен, чтобы ffmpeg не перехватывал пользовательский prompt.
+    ``-loglevel warning`` оставляет важные предупреждения, а понятное имя
+    операции выводится через logging до запуска команды.
+    """
+
     command = [_ffmpeg_path(), "-hide_banner", "-nostdin", "-loglevel", "warning"]
     command.extend(args)
     LOG.info(description)
@@ -669,6 +820,8 @@ def _run_ffmpeg(args: Sequence[str], description: str) -> None:
 
 
 def _probe_duration(path: Path) -> float:
+    """Прочитать длительность уже скачанного локального файла через ffprobe."""
+
     completed = subprocess.run(
         [
             _ffprobe_path(),
@@ -693,6 +846,13 @@ def _probe_duration(path: Path) -> float:
 
 
 def _download_source(segment: MediaSegment, destination: Path, referer: str) -> None:
+    """Скачать MP4/HLS-сегмент через ffmpeg.
+
+    Сервер МТС Линк проверяет Referer/Origin. Сначала используется прямой MP4,
+    затем HLS URL, если прямой источник не сработал. ``-c copy`` сохраняет
+    исходное качество и не перекодирует физический сегмент.
+    """
+
     headers = f"Referer: {referer}\r\nOrigin: {urlparse(referer).scheme}://{urlparse(referer).netloc}\r\n"
     candidates = [url for url in (segment.source_url, segment.hls_url) if url]
     last_error: Optional[Exception] = None
@@ -731,7 +891,12 @@ def _download_source(segment: MediaSegment, destination: Path, referer: str) -> 
 
 
 def _download_file(source_url: str, destination: Path, referer: str) -> None:
-    """Download a non-video asset, such as the original presentation PDF."""
+    """Скачать обычный бинарный ресурс, например PDF или JPG-слайд.
+
+    Для PDF нет смысла использовать ffmpeg: сохраняем байты напрямую через
+    стандартный urllib и временный путь, который вызывающий код потом
+    атомарно переименует.
+    """
 
     parsed_referer = urlparse(referer)
     request = Request(
@@ -751,6 +916,12 @@ def _download_file(source_url: str, destination: Path, referer: str) -> None:
 
 
 def _trim_tail(source: Path, destination: Path, seconds: float) -> None:
+    """Оставить хвост первого сегмента и удалить его преролл.
+
+    ``seconds`` — это не позиция начала, а фактическая длина активной части.
+    Поэтому начало вычисляется от конца исходного файла. Операция выполняется
+    после скачивания, чтобы не зависеть от точности удалённого seek.
+    """
     duration = _probe_duration(source)
     if seconds <= 0 or seconds >= duration - 0.25:
         shutil.copy2(source, destination)
@@ -781,6 +952,13 @@ def _trim_tail(source: Path, destination: Path, seconds: float) -> None:
 
 
 def _concat_segments(segment_paths: Sequence[Path], destination: Path, duration: float) -> None:
+    """Склеить локальные MP4 в один файл через concat demuxer ffmpeg.
+
+    Все физические сегменты одного источника совместимы по кодекам. Для
+    сводного режима они уже перекодированы в единый формат, поэтому тот же
+    helper используется и для финального composite-файла.
+    """
+
     list_path = destination.with_suffix(".concat.txt")
     lines = []
     for path in segment_paths:
@@ -813,7 +991,13 @@ def _concat_segments(segment_paths: Sequence[Path], destination: Path, duration:
 
 
 async def analyze_page(page_info: RecordingPage, headed: bool) -> Dict[str, Any]:
-    """Load the page, verify that it is playable, and return its record JSON."""
+    """Открыть страницу в браузере и получить JSON записи.
+
+    Сначала слушаем сетевой ответ самого плеера. Если ответ не пришёл
+    автоматически, выполняем тот же API-запрос через Playwright context.
+    ``--headed`` оставляет окно открытым для ручного входа, но cookies из
+    профиля Яндекс Браузера автоматически не импортируются.
+    """
 
     payload: Dict[str, Any] = {}
     async with async_playwright() as playwright:
@@ -823,6 +1007,8 @@ async def analyze_page(page_info: RecordingPage, headed: bool) -> Dict[str, Any]
         page.set_default_timeout(20_000)
 
         async def save_record_response(response: Any) -> None:
+            """Асинхронно сохранить подходящий JSON-ответ в общий payload."""
+
             if "/api/eventsessions/" not in response.url or "/record" not in response.url:
                 return
             try:
@@ -833,6 +1019,8 @@ async def analyze_page(page_info: RecordingPage, headed: bool) -> Dict[str, Any]
                 return
 
         def on_response(response: Any) -> None:
+            """Запланировать чтение API-ответа, не блокируя события браузера."""
+
             if "/api/eventsessions/" in response.url and "/record" in response.url:
                 asyncio.create_task(save_record_response(response))
 
@@ -890,6 +1078,8 @@ def stream_output_path(
     session_id: int,
     stream: VideoStream,
 ) -> Path:
+    """Построить имя отдельного MP4 для камеры или screen share."""
+
     stem = _output_stem(output_dir, filename, title, session_id)
     return stem.with_name(f"{stem.name}-{stream.key}.mp4")
 
@@ -901,6 +1091,8 @@ def presentation_output_path(
     session_id: int,
     stream: PresentationStream,
 ) -> Path:
+    """Построить имя отдельного PDF-файла презентации."""
+
     stem = _output_stem(output_dir, filename, title, session_id)
     return stem.with_name(f"{stem.name}-{stream.key}.pdf")
 
@@ -911,6 +1103,13 @@ def download_stream(
     output_path: Path,
     overwrite: bool,
 ) -> Path:
+    """Скачать и объединить все физические сегменты видеопотока.
+
+    Алгоритм: скачать каждый URL во временную папку, обрезать преролл первого
+    сегмента, склеить локальные части concat demuxer-ом и только затем
+    переместить результат в пользовательскую папку.
+    """
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if output_path.exists() and not overwrite:
@@ -930,6 +1129,8 @@ def download_stream(
     with tempfile.TemporaryDirectory(prefix="mts-link-") as temp_name:
         temp_dir = Path(temp_name)
         local_segments: List[Path] = []
+        # Скачиваем физические файлы по одному, чтобы не держать несколько
+        # гигабайт данных в памяти и иметь резервный HLS-вариант для каждого.
         for index, segment in enumerate(segments, start=1):
             downloaded = temp_dir / f"source-{index:03d}.mp4"
             _download_source(segment, downloaded, page_info.url)
@@ -940,6 +1141,8 @@ def download_stream(
             else:
                 local_segments.append(downloaded)
 
+        # Склеиваем только после обработки всех частей: так ошибка одного
+        # сегмента не оставляет пользователю правдоподобный, но неполный MP4.
         combined = temp_dir / "combined.mp4"
         _concat_segments(local_segments, combined, duration)
         shutil.copy2(combined, partial_path)
@@ -956,7 +1159,7 @@ def download_presentation(
     output_path: Path,
     overwrite: bool,
 ) -> Path:
-    """Download the original PDF represented by presentation.update events."""
+    """Скачать оригинальный PDF, на который ссылаются update-события."""
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists() and not overwrite:
@@ -986,6 +1189,8 @@ COMPOSITE_FPS = 25
 def _presentation_image_at(
     presentations: Sequence[PresentationStream], relative_time: float
 ) -> Optional[str]:
+    """Вернуть слайд, активный в заданной точке общей временной шкалы."""
+
     for presentation in presentations:
         current_image: Optional[str] = None
         for update in presentation.updates:
@@ -1005,11 +1210,20 @@ def build_composite_timeline(
     presentations: Sequence[PresentationStream],
     screen_stream: Optional[VideoStream],
 ) -> List[CompositeSegment]:
-    """Build the material timeline from MTS Link event timestamps."""
+    """Построить участки сводного ролика из временных меток API.
+
+    Между соседними границами выбирается материал в приоритетном порядке:
+    screen share, активный слайд, затем видео спикера. Это автоматически
+    обрабатывает начало/конец демонстраций и короткие промежутки между ними.
+    Соседние участки с одинаковым источником объединяются, чтобы не запускать
+    лишнее перекодирование.
+    """
 
     if total_duration <= 0:
         return []
 
+    # Границы нужны в каждом моменте смены материала: старт/конец источника и
+    # каждая presentation.update. Середина интервала затем классифицируется.
     boundaries = {0.0, total_duration}
     for presentation in presentations:
         boundaries.add(max(0.0, min(total_duration, presentation.start_time)))
@@ -1027,6 +1241,8 @@ def build_composite_timeline(
         duration = end_time - start_time
         if duration <= 0.05:
             continue
+        # Проверяем середину, чтобы граница ровно в момент события относилась
+        # к следующему состоянию и не создавала перекрытий.
         midpoint = start_time + duration / 2
         image_url = _presentation_image_at(presentations, midpoint)
         if (
@@ -1063,6 +1279,13 @@ def build_composite_timeline(
 def _download_composite_slide_images(
     presentations: Sequence[PresentationStream], temp_dir: Path, referer: str
 ) -> Dict[str, Path]:
+    """Скачать уникальные JPG слайдов, необходимые для composite.
+
+    Один и тот же слайд может появляться в журнале много раз. URL используется
+    как ключ, а короткий SHA-256 — как безопасное имя локального временного
+    файла.
+    """
+
     image_paths: Dict[str, Path] = {}
     for presentation in presentations:
         for update in presentation.updates:
@@ -1078,6 +1301,8 @@ def _download_composite_slide_images(
 
 
 def _fit_video_filter(width: int = COMPOSITE_WIDTH, height: int = COMPOSITE_HEIGHT) -> str:
+    """Сформировать ffmpeg-фильтр вписывания видео с чёрными полями."""
+
     return (
         f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
@@ -1085,6 +1310,8 @@ def _fit_video_filter(width: int = COMPOSITE_WIDTH, height: int = COMPOSITE_HEIG
 
 
 def _pip_filter() -> str:
+    """Сформировать фильтр масштабирования окна спикера до 320×180."""
+
     return (
         f"scale={COMPOSITE_PIP_WIDTH}:-2:force_original_aspect_ratio=decrease,"
         f"pad={COMPOSITE_PIP_WIDTH}:{COMPOSITE_PIP_WIDTH * 9 // 16}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
@@ -1092,6 +1319,8 @@ def _pip_filter() -> str:
 
 
 def _video_encode_args() -> List[str]:
+    """Вернуть общие параметры кодирования всех composite-сегментов."""
+
     return [
         "-r",
         str(COMPOSITE_FPS),
@@ -1122,6 +1351,8 @@ def _video_encode_args() -> List[str]:
 def _render_speaker_segment(
     speaker_path: Path, segment: CompositeSegment, destination: Path
 ) -> None:
+    """Перекодировать участок, где спикер является основным изображением."""
+
     _run_ffmpeg(
         [
             "-ss",
@@ -1150,6 +1381,13 @@ def _render_material_segment(
     destination: Path,
     background_offset: float = 0.0,
 ) -> None:
+    """Создать участок материала с PiP спикера и его аудио.
+
+    Для слайда используется зацикленный JPG. Для screen share используется
+    локальный MP4 с поправкой ``background_offset``. В обоих случаях второй
+    вход — общий файл спикера, из которого берутся видео и звук.
+    """
+
     duration = f"{segment.duration:.3f}"
     if segment.kind == "presentation":
         input_args = [
@@ -1202,6 +1440,8 @@ def _render_material_segment(
 def composite_output_path(
     output_dir: Path, filename: Optional[str], title: str, session_id: int
 ) -> Path:
+    """Построить имя итогового файла ``*-combined.mp4``."""
+
     stem = _output_stem(output_dir, filename, title, session_id)
     return stem.with_name(f"{stem.name}-combined.mp4")
 
@@ -1215,7 +1455,19 @@ def download_composite(
     output_path: Path,
     overwrite: bool,
 ) -> Path:
-    """Create one synchronized video with material and speaker PiP."""
+    """Собрать синхронный MP4 из камеры, презентации и screen share.
+
+    Временный pipeline такой:
+
+    * камера скачивается и становится источником непрерывного аудио;
+    * screen share скачивается как активный отдельный видеопоток;
+    * уникальные JPG слайдов скачиваются по presentation.update;
+    * каждый участок временной шкалы перекодируется в 1280×720 H.264/AAC;
+    * участки склеиваются без повторного изменения логики временной шкалы.
+
+    Полная перекодировка нужна потому, что исходные части имеют разные
+    разрешения, временные базы и типы источников (MP4 и JPG).
+    """
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists() and not overwrite:
@@ -1256,6 +1508,8 @@ def download_composite(
         )
 
         rendered_segments: List[Path] = []
+        # Отдельные файлы нужны для concat demuxer: у каждого участка должны
+        # быть одинаковые кодеки, разрешение и аудиоформат.
         for index, segment in enumerate(timeline, start=1):
             rendered = temp_dir / f"segment-{index:04d}.mp4"
             if segment.kind == "speaker":
@@ -1283,6 +1537,8 @@ def download_composite(
                 )
             rendered_segments.append(rendered)
 
+        # Здесь выполняется только техническая склейка уже нормализованных
+        # участков; содержимое и порядок определены timeline выше.
         combined = temp_dir / "combined.mp4"
         _concat_segments(rendered_segments, combined, duration)
         shutil.copy2(combined, partial_path)
@@ -1294,6 +1550,8 @@ def download_composite(
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Создать CLI-парсер с интерактивным и автоматическим режимами."""
+
     parser = argparse.ArgumentParser(
         description="Скачать полную запись с публичной страницы МТС Линк."
     )
@@ -1345,11 +1603,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 async def async_main(args: argparse.Namespace) -> int:
+    """Выполнить полный сценарий после разбора аргументов.
+
+    Порядок важен: сначала анализируем страницу и печатаем каталог, затем
+    выбираем либо отдельные источники, либо composite. Поэтому ``--dry-run``
+    никогда не начинает скачивание.
+    """
+
     page_info = parse_recording_page(args.url)
     record = await analyze_page(page_info, headed=args.headed)
+
+    # Из одного JSON строим две модели: видео-сегменты и презентационные
+    # события. Это отражает реальную структуру API, где презентация не
+    # является mediasession.
     streams, total_duration = extract_video_streams(record)
     enrich_video_streams(streams, total_duration)
     presentations = extract_presentation_streams(record, total_duration)
+    # Нумерация для пользователя идёт по времени старта, поэтому презентация
+    # оказывается между камерой и поздним screen share.
     available_streams: List[SelectableStream] = sorted(
         [*streams, *presentations],
         key=lambda stream: (stream.start_time, 0 if isinstance(stream, VideoStream) else 1),
@@ -1365,6 +1636,8 @@ async def async_main(args: argparse.Namespace) -> int:
     )
     title = str(record.get("name") or f"mts-link-{page_info.session_id}")
     if composite_mode:
+        # Composite использует отдельные источники как входные данные, но
+        # сохраняет только один пользовательский результат - combined.mp4.
         speaker_stream = next(
             (stream for stream in streams if stream.key == "speaker"), None
         )
@@ -1397,6 +1670,7 @@ async def async_main(args: argparse.Namespace) -> int:
         ", ".join(stream.title for stream in selected_streams),
         flush=True,
     )
+    # Старый режим: каждый выбранный источник получает собственный файл.
     for stream in selected_streams:
         if isinstance(stream, VideoStream):
             output_path = stream_output_path(
@@ -1431,6 +1705,8 @@ async def async_main(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    """Синхронная точка входа с единым выводом пользовательских ошибок."""
+
     parser = build_parser()
     args = parser.parse_args()
     logging.basicConfig(
