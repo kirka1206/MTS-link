@@ -1181,7 +1181,9 @@ def download_presentation(
 
 COMPOSITE_WIDTH = 1280
 COMPOSITE_HEIGHT = 720
-COMPOSITE_PIP_WIDTH = 320
+# Окно спикера уменьшено вдвое относительно исходных 320×180, чтобы не
+# перекрывать содержимое презентации и screen share.
+COMPOSITE_PIP_WIDTH = 160
 COMPOSITE_MARGIN = 16
 COMPOSITE_FPS = 25
 
@@ -1310,7 +1312,7 @@ def _fit_video_filter(width: int = COMPOSITE_WIDTH, height: int = COMPOSITE_HEIG
 
 
 def _pip_filter() -> str:
-    """Сформировать фильтр масштабирования окна спикера до 320×180."""
+    """Сформировать фильтр масштабирования окна спикера до 160×90."""
 
     return (
         f"scale={COMPOSITE_PIP_WIDTH}:-2:force_original_aspect_ratio=decrease,"
