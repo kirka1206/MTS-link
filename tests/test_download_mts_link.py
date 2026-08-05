@@ -1,14 +1,17 @@
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from download_mts_link import (
     _add_missing_streams,
+    _concat_segments,
     _parse_stream_selection,
     _render_speaker_segment,
     build_composite_timeline,
     choose_download_plan,
     CompositeSegment,
+    DownloadError,
     extract_audio_streams,
     extract_media_segments,
     extract_presentation_streams,
@@ -172,6 +175,29 @@ class RecordingParsingTests(unittest.TestCase):
             [(segment.relative_time, segment.max_duration) for segment in screen.segments],
             [(0.0, 40.0), (40.0, 60.0)],
         )
+
+    def test_concat_falls_back_to_reencoding_after_copy_error(self):
+        with TemporaryDirectory() as temp_name:
+            temp_dir = Path(temp_name)
+            segments = [temp_dir / "one.mp4", temp_dir / "two.mp4"]
+            for segment in segments:
+                segment.write_bytes(b"placeholder")
+            destination = temp_dir / "combined.mp4"
+
+            with patch(
+                "download_mts_link._run_ffmpeg",
+                side_effect=[DownloadError("copy failed"), None, None, None],
+            ) as run_ffmpeg, patch(
+                "download_mts_link._probe_stream_types", return_value={"video"}
+            ):
+                _concat_segments(segments, destination, duration=120.0)
+
+            self.assertEqual(run_ffmpeg.call_count, 4)
+            fallback_args = run_ffmpeg.call_args_list[1].args[0]
+            self.assertIn("libx264", fallback_args)
+            self.assertTrue(
+                any("setpts=PTS-STARTPTS" in str(item) for item in fallback_args)
+            )
 
     def test_extracts_presentation_update_as_a_separate_source(self):
         record = {

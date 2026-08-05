@@ -1283,6 +1283,35 @@ def _probe_stream_types(path: Path) -> set:
     return {line.strip() for line in completed.stdout.splitlines() if line.strip()}
 
 
+def _probe_video_dimensions(path: Path) -> Tuple[Optional[int], Optional[int]]:
+    """Прочитать ширину и высоту первого видеопотока локального файла."""
+
+    completed = subprocess.run(
+        [
+            _ffprobe_path(),
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=p=0:s=x",
+            str(path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        return None, None
+    try:
+        width_text, height_text = completed.stdout.strip().split("x", 1)
+        return int(width_text), int(height_text)
+    except (TypeError, ValueError):
+        return None, None
+
+
 def _add_missing_streams(
     source: Path,
     destination: Path,
@@ -1898,12 +1927,87 @@ def _trim_audio_tail(source: Path, destination: Path, seconds: float) -> None:
     )
 
 
+def _normalize_segment_for_concat(
+    source: Path,
+    destination: Path,
+    target_width: int,
+    target_height: int,
+) -> None:
+    """Перекодировать один сегмент в общий H.264/AAC-профиль.
+
+    Резервный путь склейки должен обрабатывать не только плохие DTS, но и
+    разный исходный codec между реальным сегментом и искусственной паузой
+    камеры. Поэтому сначала нормализуем каждый файл отдельно, а уже затем
+    используем быстрый concat-copy для одинаковых локальных MP4.
+    """
+
+    stream_types = _probe_stream_types(source)
+    if "video" not in stream_types:
+        raise DownloadError(f"Сегмент {source.name} не содержит видеопоток.")
+
+    video_filter = (
+        f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,"
+        f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+        "setsar=1,setpts=PTS-STARTPTS"
+    )
+    args: List[str] = [
+        "-i",
+        str(source),
+        "-map",
+        "0:v:0",
+        "-vf",
+        video_filter,
+        "-r",
+        str(NORMALIZED_SOURCE_FPS),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "18",
+        "-pix_fmt",
+        "yuv420p",
+    ]
+    if "audio" in stream_types:
+        args.extend(
+            [
+                "-map",
+                "0:a:0",
+                "-af",
+                "asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
+            ]
+        )
+    args.extend(
+        [
+            "-max_interleave_delta",
+            "0",
+            "-avoid_negative_ts",
+            "make_zero",
+            "-movflags",
+            "+faststart",
+            "-y",
+            str(destination),
+        ]
+    )
+    _run_ffmpeg(args, f"Нормализация сегмента {source.name}")
+
+
 def _concat_segments(segment_paths: Sequence[Path], destination: Path, duration: float) -> None:
     """Склеить локальные MP4 в один файл через concat demuxer ffmpeg.
 
     Все физические сегменты одного источника совместимы по кодекам. Для
     сводного режима они уже перекодированы в единый формат, поэтому тот же
-    helper используется и для финального composite-файла.
+    helper используется и для финального composite-файла. Если copy-mode
+    отвергнут muxer из-за несовместимых DTS/VP9 superframe, выполняется
+    резервная склейка с декодированием и последовательными временными метками.
     """
 
     list_path = destination.with_suffix(".concat.txt")
@@ -1932,7 +2036,70 @@ def _concat_segments(segment_paths: Sequence[Path], destination: Path, duration:
         if duration > 0:
             args.extend(["-t", f"{duration:.3f}"])
         args.extend(["-y", str(destination)])
-        _run_ffmpeg(args, "Объединение сегментов в итоговый MP4")
+        try:
+            _run_ffmpeg(args, "Объединение сегментов в итоговый MP4")
+        except DownloadError:
+            # Для части записей МТС Линк VP9-файлы имеют разные DTS и
+            # невидимые кадры на границе сегментов. В таком случае concat
+            # demuxer не может безопасно перенести исходные пакеты в новый
+            # MP4. Повторяем операцию с декодированием: setpts/asetpts
+            # сбрасывают повреждённые начальные временные метки, а выходной
+            # H.264/AAC гарантированно совместим между всеми частями.
+            LOG.warning(
+                "Не удалось склеить сегменты копированием; выполняю резервное перекодирование"
+            )
+            with tempfile.TemporaryDirectory(prefix="mts-link-concat-") as temp_name:
+                normalized_dir = Path(temp_name)
+                target_width, target_height = _probe_video_dimensions(segment_paths[0])
+                target_width = target_width or 1280
+                target_height = target_height or 720
+                # H.264 требует чётных размеров. Округление вниз сохраняет
+                # исходное соотношение сторон достаточно точно и устраняет
+                # ошибки для источников вроде 853x480.
+                target_width = max(2, target_width - target_width % 2)
+                target_height = max(2, target_height - target_height % 2)
+                normalized_paths: List[Path] = []
+                for index, source in enumerate(segment_paths, start=1):
+                    normalized = normalized_dir / f"segment-{index:03d}.mp4"
+                    _normalize_segment_for_concat(
+                        source,
+                        normalized,
+                        target_width=target_width,
+                        target_height=target_height,
+                    )
+                    normalized_paths.append(normalized)
+
+                normalized_list = normalized_dir / "segments.concat.txt"
+                normalized_lines = []
+                for path in normalized_paths:
+                    escaped = str(path).replace("'", "'\\''")
+                    normalized_lines.append(f"file '{escaped}'")
+                normalized_list.write_text(
+                    "\n".join(normalized_lines) + "\n", encoding="utf-8"
+                )
+                fallback_args: List[str] = [
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    str(normalized_list),
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "0:a:0?",
+                    "-c",
+                    "copy",
+                    "-movflags",
+                    "+faststart",
+                ]
+                if duration > 0:
+                    fallback_args.extend(["-t", f"{duration:.3f}"])
+                fallback_args.extend(["-y", str(destination)])
+                _run_ffmpeg(
+                    fallback_args,
+                    "Резервное перекодирование сегментов в итоговый MP4",
+                )
     finally:
         list_path.unlink(missing_ok=True)
 
@@ -1967,7 +2134,42 @@ def _concat_audio_segments(
         if duration > 0:
             args.extend(["-t", f"{duration:.3f}"])
         args.extend(["-y", str(destination)])
-        _run_ffmpeg(args, "Объединение аудиосегментов")
+        try:
+            _run_ffmpeg(args, "Объединение аудиосегментов")
+        except DownloadError:
+            # AAC-сегменты также иногда получают нестрогие DTS после
+            # серверного монтажа. Для аудио достаточно повторно закодировать
+            # дорожку, не создавая видео и не меняя её временную шкалу.
+            LOG.warning(
+                "Не удалось склеить аудиосегменты копированием; выполняю резервное перекодирование"
+            )
+            fallback_args: List[str] = [
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(list_path),
+                "-map",
+                "0:a:0",
+                "-vn",
+                "-af",
+                "asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
+                "-movflags",
+                "+faststart",
+            ]
+            if duration > 0:
+                fallback_args.extend(["-t", f"{duration:.3f}"])
+            fallback_args.extend(["-y", str(destination)])
+            _run_ffmpeg(fallback_args, "Резервное перекодирование аудиосегментов")
     finally:
         list_path.unlink(missing_ok=True)
 
