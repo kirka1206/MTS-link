@@ -123,6 +123,55 @@ class RecordingParsingTests(unittest.TestCase):
         self.assertEqual(streams[1].start_time, 100.0)
         self.assertEqual(streams[1].segments[0].source_url, "https://storage/screen.mp4")
 
+    def test_replaces_short_initial_snapshot_with_later_t0_snapshot(self):
+        record = {
+            "duration": 120.0,
+            "eventLogs": [
+                {
+                    "relativeTime": 0.0,
+                    "snapshot": {
+                        "data": {
+                            "mediasession": [
+                                {
+                                    "url": "https://storage/preroll.mp4",
+                                    "stream": {"conference": {"id": 1}},
+                                }
+                            ]
+                        }
+                    },
+                },
+                {
+                    "relativeTime": 0.0,
+                    "snapshot": {
+                        "data": {
+                            "mediasession": [
+                                {
+                                    "url": "https://storage/full-start.mp4",
+                                    "stream": {"conference": {"id": 1}},
+                                }
+                            ]
+                        }
+                    },
+                },
+                {
+                    "module": "mediasession.add",
+                    "relativeTime": 100.0,
+                    "data": {
+                        "url": "https://storage/next.mp4",
+                        "stream": {"conference": {"id": 1}},
+                    },
+                },
+            ],
+        }
+
+        streams, _ = extract_video_streams(record)
+
+        self.assertEqual(
+            [segment.source_url for segment in streams[0].segments],
+            ["https://storage/full-start.mp4", "https://storage/next.mp4"],
+        )
+        self.assertEqual(streams[0].segments[0].trim_duration, 100.0)
+
     def test_extracts_snapshot_only_segments_without_overlapping_files(self):
         """Повторные snapshots без mediasession.add должны покрывать запись целиком."""
 

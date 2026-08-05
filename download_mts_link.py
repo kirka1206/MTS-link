@@ -397,33 +397,47 @@ def _extract_media_streams(
 
     if has_media_additions:
         # В обычном журнале повторные snapshots появляются на границах
-        # физических cuts. Берём только первый snapshot каждого общего типа,
-        # а последующие части — из mediasession.add. Это сохраняет прежнюю
-        # обработку преролла и не дублирует сегмент камеры из следующего
-        # snapshot.
-        seen_snapshot_types: set = set()
+        # физических cuts. Для стартовой точки записи могут прийти два
+        # состояния: короткий технический преролл и затем полноценный файл,
+        # оба с relativeTime=0. Для каждого group выбираем snapshot с самым
+        # ранним relativeTime; при одинаковом времени оставляем последний
+        # URL. Snapshots позднее стартовой точки оставляем для mediasession.add.
+        initial_snapshot_times: Dict[str, float] = {}
         for event in event_logs:
             if not isinstance(event, dict):
                 continue
+            try:
+                snapshot_time = max(0.0, float(event.get("relativeTime", 0.0)))
+            except (TypeError, ValueError):
+                snapshot_time = 0.0
             snapshot = event.get("snapshot") or {}
             data = snapshot.get("data") if isinstance(snapshot, dict) else None
             sessions = data.get("mediasession") if isinstance(data, dict) else None
             if not isinstance(sessions, list):
                 continue
-            snapshot_types: set = set()
             for session in sessions:
-                broad_key = _stream_key(session) or (
-                    "audio" if _media_group_key(session) else None
-                )
-                if not broad_key or broad_key in seen_snapshot_types:
-                    snapshot_types.add(broad_key)
-                    continue
                 candidate = _media_segment(session, 0.0, initial=True)
                 group_key = _media_group_key(session)
-                if candidate and group_key and group_key not in initial_by_group:
+                if not candidate or not group_key:
+                    continue
+                # Повтор того же URL ничего не меняет. Новый URL в той же
+                # временной точке является актуальной заменой короткому
+                # прероллу и должен стать initial-сегментом.
+                current = initial_by_group.get(group_key)
+                current_source = (
+                    (current.source_url or current.hls_url) if current else None
+                )
+                candidate_source = candidate.source_url or candidate.hls_url
+                current_time = initial_snapshot_times.get(group_key)
+                is_earlier = current_time is None or snapshot_time < current_time - 0.01
+                is_same_time_replacement = (
+                    current_time is not None
+                    and abs(snapshot_time - current_time) <= 0.01
+                    and current_source != candidate_source
+                )
+                if is_earlier or is_same_time_replacement:
                     initial_by_group[group_key] = candidate
-                snapshot_types.add(broad_key)
-            seen_snapshot_types.update(item for item in snapshot_types if item)
+                    initial_snapshot_times[group_key] = snapshot_time
     else:
         # Некоторые записи не содержат ни одного mediasession.add. В них
         # каждый cut.end содержит очередной snapshot текущих медиа-сессий.
