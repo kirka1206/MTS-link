@@ -82,6 +82,9 @@ class MediaSegment:
     ``relative_time`` — момент начала сегмента относительно всей записи.
     ``trim_duration`` используется только для первого файла камеры: в нём
     иногда присутствует преролл до фактического начала записи.
+    ``max_duration`` ограничивает длину файла с начала источника. Это нужно
+    для snapshot-only записей: соседние snapshots могут перекрывать друг
+    друга, поэтому каждый предыдущий файл обрезается до начала следующего.
     """
 
     source_url: str
@@ -89,6 +92,7 @@ class MediaSegment:
     relative_time: float
     initial: bool = False
     trim_duration: Optional[float] = None
+    max_duration: Optional[float] = None
 
 
 @dataclass
@@ -381,34 +385,116 @@ def _extract_media_streams(
     conference_info = _collect_conference_info(record)
     initial_by_group: Dict[str, MediaSegment] = {}
     additions_by_group: Dict[str, List[MediaSegment]] = {}
+    try:
+        total_duration = max(0.0, float(record.get("duration") or 0.0))
+    except (TypeError, ValueError):
+        total_duration = 0.0
 
-    # Повторные snapshots появляются на границах физических cuts. Берём
-    # только первый snapshot каждого общего типа, а последующие части — из
-    # mediasession.add. Это сохраняет прежнюю обработку преролла и не
-    # дублирует сегмент камеры из следующего snapshot.
-    seen_snapshot_types: set = set()
-    for event in event_logs:
-        if not isinstance(event, dict):
-            continue
-        snapshot = event.get("snapshot") or {}
-        data = snapshot.get("data") if isinstance(snapshot, dict) else None
-        sessions = data.get("mediasession") if isinstance(data, dict) else None
-        if not isinstance(sessions, list):
-            continue
-        snapshot_types: set = set()
-        for session in sessions:
-            broad_key = _stream_key(session) or (
-                "audio" if _media_group_key(session) else None
-            )
-            if not broad_key or broad_key in seen_snapshot_types:
-                snapshot_types.add(broad_key)
+    has_media_additions = any(
+        isinstance(event, dict) and event.get("module") == "mediasession.add"
+        for event in event_logs
+    )
+
+    if has_media_additions:
+        # В обычном журнале повторные snapshots появляются на границах
+        # физических cuts. Берём только первый snapshot каждого общего типа,
+        # а последующие части — из mediasession.add. Это сохраняет прежнюю
+        # обработку преролла и не дублирует сегмент камеры из следующего
+        # snapshot.
+        seen_snapshot_types: set = set()
+        for event in event_logs:
+            if not isinstance(event, dict):
                 continue
-            candidate = _media_segment(session, 0.0, initial=True)
-            group_key = _media_group_key(session)
-            if candidate and group_key and group_key not in initial_by_group:
-                initial_by_group[group_key] = candidate
-            snapshot_types.add(broad_key)
-        seen_snapshot_types.update(item for item in snapshot_types if item)
+            snapshot = event.get("snapshot") or {}
+            data = snapshot.get("data") if isinstance(snapshot, dict) else None
+            sessions = data.get("mediasession") if isinstance(data, dict) else None
+            if not isinstance(sessions, list):
+                continue
+            snapshot_types: set = set()
+            for session in sessions:
+                broad_key = _stream_key(session) or (
+                    "audio" if _media_group_key(session) else None
+                )
+                if not broad_key or broad_key in seen_snapshot_types:
+                    snapshot_types.add(broad_key)
+                    continue
+                candidate = _media_segment(session, 0.0, initial=True)
+                group_key = _media_group_key(session)
+                if candidate and group_key and group_key not in initial_by_group:
+                    initial_by_group[group_key] = candidate
+                snapshot_types.add(broad_key)
+            seen_snapshot_types.update(item for item in snapshot_types if item)
+    else:
+        # Некоторые записи не содержат ни одного mediasession.add. В них
+        # каждый cut.end содержит очередной snapshot текущих медиа-сессий.
+        # Snapshot является накопительным: один и тот же URL повторяется, а
+        # при переподключении появляется новый URL с новым relativeTime.
+        # Поэтому здесь нельзя брать только первый snapshot — это обрезает
+        # запись до длительности первого физического файла.
+        #
+        # Для каждого логического источника сохраняем последний URL,
+        # встретившийся в одной и той же временной точке. Так короткий
+        # стартовый файл-преролл заменяется полноценным файлом из следующего
+        # snapshot, появившимся также в t=0. Повторяющиеся URL отбрасываем.
+        snapshot_candidates: Dict[str, List[MediaSegment]] = {}
+        for event in event_logs:
+            if not isinstance(event, dict):
+                continue
+            snapshot = event.get("snapshot") or {}
+            data = snapshot.get("data") if isinstance(snapshot, dict) else None
+            sessions = data.get("mediasession") if isinstance(data, dict) else None
+            if not isinstance(sessions, list):
+                continue
+            try:
+                relative_time = max(0.0, float(event.get("relativeTime", 0.0)))
+            except (TypeError, ValueError):
+                relative_time = 0.0
+            for session in sessions:
+                candidate = _media_segment(
+                    session,
+                    relative_time,
+                    initial=not snapshot_candidates.get(_media_group_key(session) or ""),
+                )
+                group_key = _media_group_key(session)
+                if not candidate or not group_key:
+                    continue
+                source = candidate.source_url or candidate.hls_url
+                candidates = snapshot_candidates.setdefault(group_key, [])
+                if any((item.source_url or item.hls_url) == source for item in candidates):
+                    continue
+                same_time = next(
+                    (index for index, item in enumerate(candidates)
+                     if abs(item.relative_time - candidate.relative_time) < 0.01),
+                    None,
+                )
+                if same_time is None:
+                    candidates.append(candidate)
+                else:
+                    # Поздний snapshot в той же точке времени является более
+                    # полным состоянием источника, поэтому заменяет ранний.
+                    candidate.initial = candidates[same_time].initial
+                    candidates[same_time] = candidate
+
+        for group_key, candidates in snapshot_candidates.items():
+            candidates.sort(key=lambda item: item.relative_time)
+            if not candidates:
+                continue
+            initial_by_group[group_key] = candidates[0]
+            additions_by_group[group_key] = candidates[1:]
+
+        # В snapshot-only формате каждый новый URL начинает новый физический
+        # интервал. Ограничиваем предыдущий файл моментом следующего URL, а
+        # последний — концом записи. Это убирает перекрытия между файлами и
+        # не позволяет отдельный источник сделать длиннее самой записи.
+        for candidates in snapshot_candidates.values():
+            candidates.sort(key=lambda item: item.relative_time)
+            for index, segment in enumerate(candidates):
+                if index + 1 < len(candidates):
+                    next_time = candidates[index + 1].relative_time
+                else:
+                    next_time = total_duration
+                if next_time > segment.relative_time:
+                    segment.max_duration = next_time - segment.relative_time
 
     # Реальные новые части приходят отдельными mediasession.add и сохраняют
     # relativeTime, необходимый как для склейки, так и для аудиомикширования.
@@ -426,11 +512,6 @@ def _extract_media_streams(
         group_key = _media_group_key(data)
         if candidate and group_key:
             additions_by_group.setdefault(group_key, []).append(candidate)
-
-    try:
-        total_duration = max(0.0, float(record.get("duration") or 0.0))
-    except (TypeError, ValueError):
-        total_duration = 0.0
 
     speaker_segments: List[MediaSegment] = []
     screen_stream: Optional[VideoStream] = None
@@ -486,7 +567,7 @@ def _extract_media_streams(
         if not segments:
             continue
 
-        if initial and additions:
+        if has_media_additions and initial and additions:
             # Только первый snapshot-файл может содержать преролл до нулевой
             # точки записи. Для audio-only initial это работает тем же образом.
             segments[0].trim_duration = max(0.0, additions[0].relative_time)
@@ -911,7 +992,10 @@ def enrich_video_streams(streams: Sequence[VideoStream], total_duration: float) 
             metadata = _probe_remote_media(source_url)
             duration = metadata.get("duration")
             if isinstance(duration, (int, float)):
-                segment_duration += float(duration)
+                effective_duration = float(duration)
+                if segment.max_duration is not None:
+                    effective_duration = min(effective_duration, segment.max_duration)
+                segment_duration += effective_duration
         if stream.segments and stream.segments[0].trim_duration is not None:
             segment_duration = min(segment_duration, stream.segments[0].trim_duration)
         stream.duration = max(0.0, segment_duration)
@@ -933,7 +1017,10 @@ def enrich_audio_streams(audio_streams: Sequence[AudioStream]) -> None:
             metadata = _probe_remote_audio(source_url)
             duration = metadata.get("duration")
             if isinstance(duration, (int, float)):
-                active_duration += float(duration)
+                effective_duration = float(duration)
+                if segment.max_duration is not None:
+                    effective_duration = min(effective_duration, segment.max_duration)
+                active_duration += effective_duration
         if stream.segments and stream.segments[0].trim_duration is not None:
             active_duration = min(active_duration, stream.segments[0].trim_duration)
         stream.duration = max(0.0, active_duration)
@@ -1609,6 +1696,147 @@ def _trim_tail(source: Path, destination: Path, seconds: float) -> None:
     )
 
 
+def _trim_head(source: Path, destination: Path, seconds: float) -> None:
+    """Оставить первые ``seconds`` секунд MP4-сегмента.
+
+    В отличие от ``_trim_tail`` эта функция удаляет хвост. Она применяется
+    только к snapshot-only источникам, где следующий URL уже обозначает
+    точку замены предыдущего источника. Сначала используется копирование
+    потоков, а при проблеме с ключевым кадром — короткое перекодирование с
+    сохранением всех доступных дорожек.
+    """
+
+    duration = _probe_duration(source)
+    if seconds <= 0:
+        raise DownloadError("Нельзя создать сегмент нулевой длительности.")
+    if seconds >= duration - 0.25:
+        shutil.copy2(source, destination)
+        return
+
+    trim_args = [
+        "-i",
+        str(source),
+        "-t",
+        f"{seconds:.3f}",
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-c",
+        "copy",
+        "-avoid_negative_ts",
+        "make_zero",
+        "-y",
+        str(destination),
+    ]
+    _run_ffmpeg(trim_args, f"Ограничение перекрывающегося сегмента ({seconds:.1f} с)")
+
+    source_types = _probe_stream_types(source)
+    copied_types = _probe_stream_types(destination)
+    required_types = {"video"}
+    if "audio" in source_types:
+        required_types.add("audio")
+    if required_types.issubset(copied_types):
+        return
+
+    LOG.warning(
+        "Обрезанный snapshot не содержит нужные потоки (%s), выполняю резервное перекодирование",
+        ", ".join(sorted(copied_types)) or "потоки отсутствуют",
+    )
+    destination.unlink(missing_ok=True)
+    _run_ffmpeg(
+        [
+            "-i",
+            str(source),
+            "-t",
+            f"{seconds:.3f}",
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-avoid_negative_ts",
+            "make_zero",
+            "-y",
+            str(destination),
+        ],
+        f"Ограничение перекрывающегося сегмента ({seconds:.1f} с)",
+    )
+
+
+def _trim_audio_head(source: Path, destination: Path, seconds: float) -> None:
+    """Оставить первые ``seconds`` секунд аудиосегмента snapshot-only записи."""
+
+    duration = _probe_duration(source)
+    if seconds <= 0:
+        raise DownloadError("Нельзя создать аудиосегмент нулевой длительности.")
+    if seconds >= duration - 0.25:
+        shutil.copy2(source, destination)
+        return
+
+    _run_ffmpeg(
+        [
+            "-i",
+            str(source),
+            "-t",
+            f"{seconds:.3f}",
+            "-map",
+            "0:a:0",
+            "-vn",
+            "-c:a",
+            "copy",
+            "-avoid_negative_ts",
+            "make_zero",
+            "-y",
+            str(destination),
+        ],
+        f"Ограничение перекрывающегося аудиосегмента ({seconds:.1f} с)",
+    )
+    if "audio" in _probe_stream_types(destination):
+        return
+
+    destination.unlink(missing_ok=True)
+    _run_ffmpeg(
+        [
+            "-i",
+            str(source),
+            "-t",
+            f"{seconds:.3f}",
+            "-map",
+            "0:a:0",
+            "-vn",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-avoid_negative_ts",
+            "make_zero",
+            "-y",
+            str(destination),
+        ],
+        f"Ограничение перекрывающегося аудиосегмента ({seconds:.1f} с)",
+    )
+
+
 def _trim_audio_tail(source: Path, destination: Path, seconds: float) -> None:
     """Оставить активный хвост audio-only сегмента без требования видео."""
 
@@ -1957,6 +2185,19 @@ def download_stream(
                 temp_dir / f"source-{index:03d}-prepared.mp4",
                 stream,
             )
+            if segment.max_duration is not None:
+                # В snapshot-only журнале relativeTime обозначает начало
+                # нового физического файла. Ограничиваем его с начала, чтобы
+                # предыдущий snapshot не дублировал уже заменённый материал.
+                if segment.max_duration <= 0.0:
+                    LOG.warning(
+                        "Пропускаю snapshot с нулевым интервалом: %s",
+                        segment.source_url or segment.hls_url,
+                    )
+                    continue
+                limited = temp_dir / f"source-{index:03d}-limited.mp4"
+                _trim_head(prepared, limited, segment.max_duration)
+                prepared = limited
             if index == 1 and segment.trim_duration is not None:
                 trimmed = temp_dir / "source-001-trimmed.mp4"
                 _trim_tail(prepared, trimmed, segment.trim_duration)
@@ -2013,6 +2254,18 @@ def download_audio_stream(
 
             downloaded = temp_dir / f"source-{index:03d}.m4a"
             _download_audio_source(segment, downloaded, page_info.url)
+            if segment.max_duration is not None:
+                # Та же логика нужна отдельным аудиопотокам участников: при
+                # переподключении новый snapshot может перекрывать старый.
+                if segment.max_duration <= 0.0:
+                    LOG.warning(
+                        "Пропускаю аудиоснимок с нулевым интервалом: %s",
+                        segment.source_url or segment.hls_url,
+                    )
+                    continue
+                limited = temp_dir / f"source-{index:03d}-limited.m4a"
+                _trim_audio_head(downloaded, limited, segment.max_duration)
+                downloaded = limited
             if index == 1 and segment.trim_duration is not None:
                 trimmed = temp_dir / "source-001-trimmed.m4a"
                 _trim_audio_tail(downloaded, trimmed, segment.trim_duration)

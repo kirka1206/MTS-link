@@ -120,6 +120,59 @@ class RecordingParsingTests(unittest.TestCase):
         self.assertEqual(streams[1].start_time, 100.0)
         self.assertEqual(streams[1].segments[0].source_url, "https://storage/screen.mp4")
 
+    def test_extracts_snapshot_only_segments_without_overlapping_files(self):
+        """Повторные snapshots без mediasession.add должны покрывать запись целиком."""
+
+        def snapshot(relative_time, speaker_url, screen_url):
+            return {
+                "relativeTime": relative_time,
+                "snapshot": {
+                    "data": {
+                        "mediasession": [
+                            {
+                                "url": speaker_url,
+                                "stream": {"conference": {"id": 10}},
+                            },
+                            {
+                                "url": screen_url,
+                                "stream": {"screensharing": {"id": 20}},
+                            },
+                        ]
+                    }
+                },
+            }
+
+        record = {
+            "duration": 100.0,
+            "eventLogs": [
+                snapshot(0.0, "https://storage/short-start.mp4", "https://storage/screen-1.mp4"),
+                snapshot(0.0, "https://storage/speaker-1.mp4", "https://storage/screen-1.mp4"),
+                snapshot(40.0, "https://storage/speaker-2.mp4", "https://storage/screen-2.mp4"),
+            ],
+        }
+
+        streams, duration = extract_video_streams(record)
+
+        self.assertEqual(duration, 100.0)
+        speaker = next(stream for stream in streams if stream.key == "speaker")
+        screen = next(stream for stream in streams if stream.key == "screen-share")
+        self.assertEqual(
+            [segment.source_url for segment in speaker.segments],
+            ["https://storage/speaker-1.mp4", "https://storage/speaker-2.mp4"],
+        )
+        self.assertEqual(
+            [segment.source_url for segment in screen.segments],
+            ["https://storage/screen-1.mp4", "https://storage/screen-2.mp4"],
+        )
+        self.assertEqual(
+            [(segment.relative_time, segment.max_duration) for segment in speaker.segments],
+            [(0.0, 40.0), (40.0, 60.0)],
+        )
+        self.assertEqual(
+            [(segment.relative_time, segment.max_duration) for segment in screen.segments],
+            [(0.0, 40.0), (40.0, 60.0)],
+        )
+
     def test_extracts_presentation_update_as_a_separate_source(self):
         record = {
             "duration": 120.0,
