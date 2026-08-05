@@ -54,7 +54,10 @@ from playwright.async_api import async_playwright
 LOG = logging.getLogger("mts-link-downloader")
 API_HOST = "https://gw.mts-link.ru"
 RECORD_PATH_RE = re.compile(
-    r"^/j/(?P<organization>[^/]+)/(?P<event_id>\d+)/"
+    # В ссылках встречаются как числовые event_id, так и значения вроде
+    # ``iot_1007``. Ограничиваем поле границами сегмента URL, а не только
+    # цифрами; session_id по-прежнему должен оставаться числовым.
+    r"^/j/(?P<organization>[^/]+)/(?P<event_id>[^/]+)/"
     r"record-new/(?P<session_id>\d+)/?$"
 )
 

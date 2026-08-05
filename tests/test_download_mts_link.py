@@ -28,6 +28,13 @@ class RecordingParsingTests(unittest.TestCase):
         self.assertEqual(page.session_id, 18659320070)
         self.assertIn("/api/eventsessions/18659320070/record", page.api_url)
 
+    def test_parse_recording_page_accepts_alphanumeric_event_id(self):
+        page = parse_recording_page(
+            "https://my.mts-link.ru/j/Flant/iot_1007/record-new/19856070522"
+        )
+        self.assertEqual(page.session_id, 19856070522)
+        self.assertIn("/api/eventsessions/19856070522/record", page.api_url)
+
     def test_parse_stream_selection(self):
         self.assertEqual(_parse_stream_selection("all", 3), [0, 1, 2])
         self.assertEqual(_parse_stream_selection("1,3", 3), [0, 2])
