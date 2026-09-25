@@ -1297,6 +1297,38 @@ def _probe_stream_types(path: Path) -> set:
     return {line.strip() for line in completed.stdout.splitlines() if line.strip()}
 
 
+def _probe_video_codec(path: Path) -> Optional[str]:
+    """Вернуть имя кодека первого видеопотока локального файла.
+
+    Одного наличия видеодорожки недостаточно для безопасной склейки через
+    ``-c copy``: concat demuxer может успешно записать пакеты разных кодеков
+    в MP4 с параметрами первого сегмента. Поэтому перед копированием
+    сравниваем кодеки всех входных частей.
+    """
+
+    completed = subprocess.run(
+        [
+            _ffprobe_path(),
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name",
+            "-of",
+            "default=nw=1:nk=1",
+            str(path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        return None
+    codec = completed.stdout.strip().splitlines()
+    return codec[0] if codec else None
+
+
 def _probe_video_dimensions(path: Path) -> Tuple[Optional[int], Optional[int]]:
     """Прочитать ширину и высоту первого видеопотока локального файла."""
 
@@ -1702,6 +1734,32 @@ def _trim_tail(source: Path, destination: Path, seconds: float) -> None:
         ", ".join(sorted(copied_types)) or "потоки отсутствуют",
     )
     destination.unlink(missing_ok=True)
+    # Короткий обрезанный фрагмент должен сохранить кодек исходника, если он
+    # поддерживается здесь. Иначе, например, первые 3 секунды VP9 превратятся
+    # в H.264, а следующие исходные VP9-сегменты при concat-copy будут
+    # записаны в контейнер как H.264, хотя их пакеты не перекодировались.
+    if _probe_video_codec(source) == "vp9":
+        video_encoder_args = [
+            "-c:v",
+            "libvpx-vp9",
+            "-deadline",
+            "good",
+            "-cpu-used",
+            "4",
+            "-crf",
+            "18",
+            "-b:v",
+            "0",
+        ]
+    else:
+        video_encoder_args = [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "18",
+        ]
     _run_ffmpeg(
         [
             "-i",
@@ -1714,12 +1772,7 @@ def _trim_tail(source: Path, destination: Path, seconds: float) -> None:
             "0:v:0",
             "-map",
             "0:a:0?",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "18",
+            *video_encoder_args,
             "-pix_fmt",
             "yuv420p",
             "-c:a",
@@ -2017,11 +2070,11 @@ def _normalize_segment_for_concat(
 def _concat_segments(segment_paths: Sequence[Path], destination: Path, duration: float) -> None:
     """Склеить локальные MP4 в один файл через concat demuxer ffmpeg.
 
-    Все физические сегменты одного источника совместимы по кодекам. Для
-    сводного режима они уже перекодированы в единый формат, поэтому тот же
-    helper используется и для финального composite-файла. Если copy-mode
-    отвергнут muxer из-за несовместимых DTS/VP9 superframe, выполняется
-    резервная склейка с декодированием и последовательными временными метками.
+    Если все части используют один видеокодек, сначала пробуем быстрое
+    копирование исходных пакетов. При разных кодеках либо ошибке muxer все
+    части по отдельности приводятся к общему H.264/AAC-профилю; это важно,
+    потому что concat demuxer может успешно скопировать смешанные кодеки,
+    оставив последующие пакеты размеченными как кодек первого файла.
     """
 
     list_path = destination.with_suffix(".concat.txt")
@@ -2051,8 +2104,18 @@ def _concat_segments(segment_paths: Sequence[Path], destination: Path, duration:
             args.extend(["-t", f"{duration:.3f}"])
         args.extend(["-y", str(destination)])
         try:
+            video_codecs = {
+                codec
+                for path in segment_paths
+                if (codec := _probe_video_codec(path)) is not None
+            }
+            if len(video_codecs) > 1:
+                raise DownloadError(
+                    "Сегменты содержат разные видеокодеки: "
+                    + ", ".join(sorted(video_codecs))
+                )
             _run_ffmpeg(args, "Объединение сегментов в итоговый MP4")
-        except DownloadError:
+        except DownloadError as exc:
             # Для части записей МТС Линк VP9-файлы имеют разные DTS и
             # невидимые кадры на границе сегментов. В таком случае concat
             # demuxer не может безопасно перенести исходные пакеты в новый
@@ -2060,7 +2123,9 @@ def _concat_segments(segment_paths: Sequence[Path], destination: Path, duration:
             # сбрасывают повреждённые начальные временные метки, а выходной
             # H.264/AAC гарантированно совместим между всеми частями.
             LOG.warning(
-                "Не удалось склеить сегменты копированием; выполняю резервное перекодирование"
+                "Сегменты нельзя безопасно склеить копированием (%s); "
+                "выполняю резервное перекодирование",
+                exc,
             )
             with tempfile.TemporaryDirectory(prefix="mts-link-concat-") as temp_name:
                 normalized_dir = Path(temp_name)
