@@ -26,7 +26,7 @@ from download_mts_link import (
 class RecordingParsingTests(unittest.TestCase):
     def test_parse_recording_page(self):
         page = parse_recording_page(
-            "https://my.mts-link.ru/j/Deckhouse/19443161368/record-new/18659320070"
+            "https://my.mts-link.ru/j/something/194431sds61368/record-new/1865932012070"
         )
         self.assertEqual(page.session_id, 18659320070)
         self.assertIn("/api/eventsessions/18659320070/record", page.api_url)
